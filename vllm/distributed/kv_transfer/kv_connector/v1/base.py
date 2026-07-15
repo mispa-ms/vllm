@@ -258,6 +258,20 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def set_decode_local_draft_layers(self, layer_names: set[str]) -> None:
+        """
+        Report decode-local speculative-draft (EAGLE/MTP) KV layer names.
+
+        These layers exist only on decode workers and are never transferred
+        cross-instance. Connectors that register per layer (e.g. NIXL) should
+        exclude them so decode advertises the same KV regions as prefill,
+        allowing speculation to be enabled on decode only. Default: no-op.
+
+        Args:
+            layer_names: names of decode-local draft attention KV layers
+        """
+        return
+
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type["AttentionBackend"]
     ):

@@ -498,7 +498,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
         )
-        self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        # Decode-local speculative-draft (EAGLE/MTP) KV layers are never
+        # transferred cross-instance; exclude them so speculation can run on
+        # decode only (issue #48221).
+        draft_layers = getattr(self.speculator, "draft_attn_layer_names", None)
+        self.kv_connector = get_kv_connector(
+            self.vllm_config, kv_caches_dict, draft_layers
+        )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""

@@ -242,6 +242,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.register_cross_layers_kv_cache(kv_cache, attn_backend)
 
+    def set_decode_local_draft_layers(self, layer_names: set[str]) -> None:
+        for c in self._connectors:
+            c.set_decode_local_draft_layers(layer_names)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         for c in self._connectors:
             c.register_kv_caches(kv_caches)

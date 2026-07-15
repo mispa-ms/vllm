@@ -46,10 +46,18 @@ class KVConnector:
 
 class ActiveKVConnector(KVConnector):
     def __init__(
-        self, vllm_config: VllmConfig, kv_caches_dict: dict[str, torch.Tensor]
+        self,
+        vllm_config: VllmConfig,
+        kv_caches_dict: dict[str, torch.Tensor],
+        decode_local_draft_layers: set[str] | None = None,
     ):
         self.vllm_config = vllm_config
         self.kv_connector = get_kv_transfer_group()
+        # Exclude decode-local speculative-draft (EAGLE/MTP) KV layers from the
+        # transfer so decode advertises the same KV regions as prefill; must be
+        # set before register_kv_caches (issue #48221).
+        if decode_local_draft_layers:
+            self.kv_connector.set_decode_local_draft_layers(decode_local_draft_layers)
         # Register kv caches with KV Connector if applicable.
         # TODO: support cross_layers_kv_cache
         # (see https://github.com/vllm-project/vllm/pull/27743)
@@ -114,10 +122,12 @@ NO_OP_KV_CONNECTOR = KVConnector()
 
 
 def get_kv_connector(
-    vllm_config: VllmConfig, kv_caches_dict: dict[str, torch.Tensor]
+    vllm_config: VllmConfig,
+    kv_caches_dict: dict[str, torch.Tensor],
+    decode_local_draft_layers: set[str] | None = None,
 ) -> KVConnector:
     if not has_kv_transfer_group():
         # No-op connector.
         return NO_OP_KV_CONNECTOR
 
-    return ActiveKVConnector(vllm_config, kv_caches_dict)
+    return ActiveKVConnector(vllm_config, kv_caches_dict, decode_local_draft_layers)

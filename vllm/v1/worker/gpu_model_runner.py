@@ -7545,9 +7545,7 @@ class GPUModelRunner(
             # handshake layer-count check (issue #48221).
             drafter = getattr(self, "drafter", None)
             draft_layers = getattr(drafter, "_draft_attn_layer_names", None)
-            if draft_layers and hasattr(
-                kv_transfer_group, "set_decode_local_draft_layers"
-            ):
+            if draft_layers:
                 kv_transfer_group.set_decode_local_draft_layers(draft_layers)
             if self.cross_layers_kv_cache is not None:
                 assert self.cross_layers_attn_backend is not None
