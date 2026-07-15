@@ -512,11 +512,18 @@ def test_register_kv_caches_skips_decode_local_draft_layers(dist_init):
         prefill = _register(["layer0", "layer1"])
         decode = _register(["layer0", "layer1"], draft_layer="draft_layer")
 
-    # Decode advertises the same number of KV regions as prefill: the draft
-    # layer is skipped, so the "Number of KV layers must match" invariant holds
-    # and the handshake succeeds.
+    # The draft layer is skipped, so decode registers only the main-model
+    # layers and does not keep the draft KV in its transfer bookkeeping.
     assert len(decode.block_len_per_layer) == len(prefill.block_len_per_layer)
     assert "draft_layer" not in decode.device_kv_caches
+
+    # add_remote_agent asserts len(local block_len_per_layer) == len(remote
+    # block_lens). Decode this from prefill's serialized handshake metadata to
+    # confirm the exact quantity checked at handshake matches (issue #48221).
+    prefill_meta = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(
+        prefill.xfer_handshake_metadata.agent_metadata_bytes
+    )
+    assert len(decode.block_len_per_layer) == len(prefill_meta.block_lens)
 
 
 class FakeNixlConnectorWorker(NixlConnectorWorker):
