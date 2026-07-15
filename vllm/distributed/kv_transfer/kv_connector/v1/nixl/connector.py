@@ -223,6 +223,10 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
     # Worker Side Methods
     ############################################################
+    def set_decode_local_draft_layers(self, layer_names: set[str]) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.set_decode_local_draft_layers(layer_names)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)

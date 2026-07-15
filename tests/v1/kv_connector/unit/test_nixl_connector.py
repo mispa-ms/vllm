@@ -463,6 +463,62 @@ def test_kv_transfer_handshake(dist_init):
         scheduler_connector.shutdown()
 
 
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_register_kv_caches_skips_decode_local_draft_layers(dist_init):
+    """Decode-local speculative-draft KV layers must not be NIXL-registered.
+
+    With EAGLE/MTP enabled only on decode, the draft attention adds a
+    decode-local KV layer that prefill does not have. If it were registered,
+    decode would advertise more KV regions than prefill and the P/D handshake
+    would fail with "Number of KV layers must match". The model runner reports
+    the draft layer names via ``set_decode_local_draft_layers``; the connector
+    must exclude them so decode registers the same main-model layers as
+    prefill. Regression guard for issue #48221 (decode-only speculation).
+    """
+    from vllm.config import set_current_vllm_config
+
+    vllm_config = create_vllm_config()
+    # In case the test runs on a non-GPU machine.
+    vllm_config.kv_transfer_config.kv_buffer_device = "cpu"
+
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=4, head_size=16, dtype=torch.float16
+    )
+    kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
+        num_blocks=2, block_size=16, num_kv_heads=4, head_size=16
+    )
+
+    def _register(layer_names, draft_layer=None):
+        all_layers = list(layer_names) + ([draft_layer] if draft_layer else [])
+        kv_cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(all_layers, spec)],
+        )
+        connector = NixlConnector(
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
+        )
+        if draft_layer:
+            connector.set_decode_local_draft_layers({draft_layer})
+        connector.register_kv_caches(
+            {n: torch.zeros(*kv_cache_shape, dtype=torch.float16) for n in all_layers}
+        )
+        return connector.connector_worker
+
+    with set_current_vllm_config(vllm_config):
+        prefill = _register(["layer0", "layer1"])
+        decode = _register(["layer0", "layer1"], draft_layer="draft_layer")
+
+    # Decode advertises the same number of KV regions as prefill: the draft
+    # layer is skipped, so the "Number of KV layers must match" invariant holds
+    # and the handshake succeeds.
+    assert len(decode.block_len_per_layer) == len(prefill.block_len_per_layer)
+    assert "draft_layer" not in decode.device_kv_caches
+
+
 class FakeNixlConnectorWorker(NixlConnectorWorker):
     REMOTE_ENGINE_ID = "remote_engine"
 

@@ -57,7 +57,7 @@ th:not(:first-child) {
 | Multimodal | ❔ | ❔ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | Encoder-Decoder | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
-<sup>1</sup> P and D instances must use the same speculation configuration.
+<sup>1</sup> Speculation may be enabled on decode only, or on both P and D. Decode-local draft (EAGLE/MTP) KV layers are excluded from the KV transfer, so P and D do not need to share the same speculation configuration.
 
 <sup>2</sup> Requires `FLASH_ATTN` or `FLASHINFER` backend **and** `HND` KV cache layout. Enable via `--kv-transfer-config '{"kv_connector_extra_config": {"enable_cross_layers_blocks": "True"}}'`.
 

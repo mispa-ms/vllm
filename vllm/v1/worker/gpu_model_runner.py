@@ -7539,6 +7539,16 @@ class GPUModelRunner(
 
         if has_kv_transfer_group() and not is_profiling:
             kv_transfer_group = get_kv_transfer_group()
+            # Decode-local speculative-draft (EAGLE/MTP) KV layers are never
+            # transferred cross-instance. Tell the connector to exclude them so
+            # speculation can be enabled on decode only without tripping the P/D
+            # handshake layer-count check (issue #48221).
+            drafter = getattr(self, "drafter", None)
+            draft_layers = getattr(drafter, "_draft_attn_layer_names", None)
+            if draft_layers and hasattr(
+                kv_transfer_group, "set_decode_local_draft_layers"
+            ):
+                kv_transfer_group.set_decode_local_draft_layers(draft_layers)
             if self.cross_layers_kv_cache is not None:
                 assert self.cross_layers_attn_backend is not None
                 kv_transfer_group.register_cross_layers_kv_cache(

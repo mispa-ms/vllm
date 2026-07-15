@@ -285,6 +285,13 @@ class NixlBaseConnectorWorker:
             for group in kv_cache_config.kv_cache_groups
             for layer in group.layer_names
         }
+        # Decode-local speculative-draft (EAGLE/MTP) KV layer names. Populated
+        # by the model runner via `set_decode_local_draft_layers` before
+        # `register_kv_caches`. These layers are allocated only on decode
+        # workers and must not be NIXL-registered or transferred; otherwise
+        # decode advertises more KV regions than prefill and the P/D handshake
+        # layer-count check fails when speculation is enabled on decode only.
+        self._decode_local_draft_layers: set[str] = set()
         self.hma_group_size = len(kv_cache_config.kv_cache_tensors)
 
         # ---- Model state (derived from model config) ----
@@ -1020,8 +1027,35 @@ class NixlBaseConnectorWorker:
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
 
+    def set_decode_local_draft_layers(self, layer_names: set[str]) -> None:
+        """Record decode-local speculative-draft (EAGLE/MTP) KV layer names.
+
+        These layers are allocated only on decode workers and are excluded
+        from NIXL registration and transfer so decode advertises the same KV
+        regions as prefill (issue #48221).
+        """
+        self._decode_local_draft_layers = set(layer_names)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
+
+        # Drop decode-local speculative-draft (EAGLE/MTP) KV layers before any
+        # registration path. They are decode-only and never transferred, so
+        # decode must advertise the same KV regions as prefill for the P/D
+        # handshake layer-count check to pass (issue #48221).
+        if self._decode_local_draft_layers:
+            skipped = self._decode_local_draft_layers & kv_caches.keys()
+            if skipped:
+                logger.info_once(
+                    "Skipping decode-local draft KV layers for NIXL "
+                    "registration: %s",
+                    ", ".join(sorted(skipped)),
+                )
+                kv_caches = {
+                    name: cache
+                    for name, cache in kv_caches.items()
+                    if name not in self._decode_local_draft_layers
+                }
 
         # Detect packed allocation: all tensors are strided views into the
         # same backing storage (different data_ptr but same storage).
