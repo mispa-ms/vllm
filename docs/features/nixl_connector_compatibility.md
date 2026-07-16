@@ -57,7 +57,7 @@ th:not(:first-child) {
 | Multimodal | ❔ | ❔ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | Encoder-Decoder | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
-<sup>1</sup> Speculation may be enabled on decode only, or on both P and D. Decode-local draft (EAGLE/MTP) KV layers are excluded from the KV transfer, so P and D do not need to share the same speculation configuration.
+<sup>1</sup> Speculation may be enabled on decode only, or on both P and D; decode-local draft (EAGLE/MTP) KV layers are excluded from the KV transfer, so P and D do not need to share the same speculation configuration. Validated for drafts that share the main model's KV cache group (e.g. EAGLE3/MTP). Drafts that occupy a separate KV cache group are not yet covered for decode-only speculation (the per-request transfer still groups by all KV cache groups).
 
 <sup>2</sup> Requires `FLASH_ATTN` or `FLASHINFER` backend **and** `HND` KV cache layout. Enable via `--kv-transfer-config '{"kv_connector_extra_config": {"enable_cross_layers_blocks": "True"}}'`.
 
