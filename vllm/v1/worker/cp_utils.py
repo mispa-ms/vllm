@@ -96,8 +96,15 @@ def prepare_dcp_dummy_context_metadata(
     # DCP graph warmup may exercise context attention, so block-table entries
     # must point at allocated KV blocks.
     assert kv_cache_config is not None
+    # During memory profiling the KV cache config is a minimal placeholder
+    # (see GPUModelRunner._init_minimal_kv_cache_for_profiling) that can have a
+    # single block, leaving no valid non-zero block id to point dummy entries
+    # at (`block_idx % max_valid_block_id` would also divide by zero). Skip the
+    # dummy-context fill in that degenerate case; real graph captures run after
+    # KV cache sizing and always have many blocks.
+    if kv_cache_config.num_blocks <= 1:
+        return
     max_valid_block_id = kv_cache_config.num_blocks - 1
-    assert max_valid_block_id > 0
     for blk_table in input_batch.block_table.block_tables:
         max_row_blocks = (
             blk_table.max_num_blocks_per_req // blk_table.blocks_per_kv_block
