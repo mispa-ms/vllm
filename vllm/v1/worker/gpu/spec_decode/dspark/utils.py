@@ -129,6 +129,18 @@ def _load_target_embed_tokens_for_pp(vllm_config: VllmConfig) -> nn.Module:
     model_config = vllm_config.model_config
     text_config = model_config.hf_text_config
     model_dir = model_config.model
+    if not os.path.isdir(model_dir):
+        # model_config.model is an HF repo id whenever the model was not given
+        # as a local path; resolve it to the already-populated cache snapshot.
+        # local_files_only: the weights are staged ahead of the job, and a
+        # multi-hundred-GB download inside a benchmark is never the right answer.
+        from huggingface_hub import snapshot_download
+
+        model_dir = snapshot_download(
+            model_dir,
+            revision=model_config.revision,
+            local_files_only=True,
+        )
 
     # Locate the embedding tensor: prefer the shard index, else scan the shards.
     key = None
