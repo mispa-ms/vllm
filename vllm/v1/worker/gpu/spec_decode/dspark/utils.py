@@ -10,6 +10,7 @@ import torch.nn as nn
 from safetensors import safe_open
 
 from vllm.config import VllmConfig, replace
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.utils import PPMissingLayer
@@ -55,6 +56,20 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # VllmConfig post-init restores the target's quant config because the target
     # config is retained for DSpark's target-layer metadata, so we must override it.
     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
+
+    # Under PP the drafter is built only on the last stage, but the
+    # fastsafetensors loader collectives over torch.distributed.group.WORLD
+    # (weight_utils.fastsafetensors_weights_iterator). The stages that never
+    # build a drafter never join, and every rank hangs until the NCCL collective
+    # times out. Fall back to the default loader for the draft; it is a handful
+    # of layers, so the parallel loader buys nothing here anyway.
+    if get_pp_group().world_size > 1 and draft_vllm_config.load_config.load_format == (
+        "fastsafetensors"
+    ):
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            load_config=replace(draft_vllm_config.load_config, load_format="auto"),
+        )
 
     with set_model_tag("dspark_head"):
         draft_model = get_model(
