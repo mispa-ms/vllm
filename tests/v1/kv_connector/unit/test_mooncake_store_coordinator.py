@@ -722,3 +722,48 @@ def test_reported_hit_is_an_object_boundary_for_every_group_under_dcp(dcp):
             f"dcp={dcp}: reported hit {hit} is not an object boundary for "
             f"group {g_idx} (block_size={block_size})"
         )
+
+
+def test_load_mask_is_never_shortened_by_the_exact_boundary_retry():
+    """The recv-side pool answers "present" to anything, so the retry has no
+    truth to check there. If it ran, load_mask would return a mask for a shorter
+    length while its caller keeps using the original token_len, and
+    process_tokens' trailing chunks would fall off the end of the mask -- those
+    blocks stay uninitialized in the local KV pool. Silent, unlike -704.
+    """
+    mamba_block, hash_block_size, dcp = 1536, 128, 8
+    groups = [
+        KVCacheGroupSpec(["L0"], _full(mamba_block * dcp)),
+        KVCacheGroupSpec(["L1"], _mamba_align(mamba_block)),
+    ]
+    coord = _make_coord(groups, hash_block_size, use_eagle=True)
+    token_len = 61440  # 5 * 12288: block-aligned, as a validated hit must be
+    hashes = _hashes(token_len // hash_block_size)
+
+    masks = coord.load_mask(hashes, token_len)
+
+    for g, mask in zip(groups, masks, strict=True):
+        block_size = g.kv_cache_spec.block_size
+        assert len(mask) == token_len // block_size, (
+            f"load_mask shortened group with block_size={block_size}: "
+            f"{len(mask)} chunks for {token_len} tokens"
+        )
+
+
+def test_lookup_does_not_crash_on_a_mamba_only_layout():
+    """Partial hits are enabled by a Mamba group alone, so the revalidation can
+    be reached with no FullAttention group present. Upstream asserts one there.
+    """
+    hash_block_size = 128
+    groups = [KVCacheGroupSpec(["L0"], _mamba_align(1536))]
+    coord = _make_coord(groups, hash_block_size, use_eagle=True)
+    assert coord.enable_partial_hash_hits
+    hashes = _hashes(12)
+    exists = {(0, bytes(hashes[11]))}
+
+    _masks, hit = coord.find_longest_cache_hit(
+        hashes,
+        max_length=1536,
+        cached_block_pool=ExternalCachedBlockPool(hash_block_size, exists),
+    )
+    assert hit >= 0
