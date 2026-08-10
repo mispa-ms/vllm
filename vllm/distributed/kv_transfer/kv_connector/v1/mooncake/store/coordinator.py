@@ -16,7 +16,6 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
 )
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -68,7 +67,6 @@ class MooncakeStoreCoordinator:
         hash_block_size: int,
         use_eagle: bool = False,
         retention_interval: int | None = None,
-        dcp_world_size: int = 1,
     ) -> None:
         assert all(
             g.kv_cache_spec.block_size % hash_block_size == 0 for g in kv_cache_groups
@@ -85,7 +83,7 @@ class MooncakeStoreCoordinator:
         self.hash_block_size = hash_block_size
         self.lcm_block_size = scheduler_block_size
         self.enable_partial_hash_hits = partial_hash_hits_enabled(
-            kv_cache_groups, hash_block_size, dcp_world_size
+            kv_cache_groups, hash_block_size
         )
         self.use_eagle = use_eagle
         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
@@ -400,38 +398,12 @@ def _unwrap_spec(spec: KVCacheSpec) -> KVCacheSpec:
 
 
 def partial_hash_hits_enabled(
-    kv_cache_groups: list[KVCacheGroupSpec],
-    hash_block_size: int,
-    dcp_world_size: int = 1,
+    kv_cache_groups: list[KVCacheGroupSpec], hash_block_size: int
 ) -> bool:
-    """Mirror of core's ``HybridKVCacheCoordinator.enable_partial_hash_hits``.
+    """Mirror of core's ``HybridKVCacheCoordinator.enable_partial_hash_hits``
+    (its dcp == 1 clause holds: the connector rejects hybrid + DCP/PCP > 1).
     Single copy on purpose — scheduler and coordinator must not disagree.
-
-    A hash-aligned hit length is only safe while every group that needs *every*
-    chunk can serve one: the store holds whole blocks, so a hit ending mid-block
-    asks for a key the producer never wrote. Off DCP that holds — the coarse
-    group is the Mamba one, which is tail-only, and attention runs at
-    ``hash_block_size``. Under DCP ``resolve_kv_cache_block_sizes`` scales the
-    attention block by ``dcp``, so attention becomes the coarse group and it
-    needs all of its chunks. Fall back to ``lcm_block_size`` alignment there.
-
-    No block-size test on the attention group: callers pass different lists —
-    the scheduler the raw config, the worker its DCP-scaled copy — and any size
-    comparison would answer differently for the two. ``block_size`` is always a
-    multiple of ``hash_block_size``, so under ``dcp > 1`` the effective
-    attention block always exceeds it and the presence of the group is the whole
-    condition. A Mamba-only layout is unaffected: DCP does not scale it.
-
-    Measured: without this, every load of the scaled group returns Mooncake
-    OBJECT_NOT_FOUND (-704) for its trailing chunk and ``recompute`` reschedules
-    the request forever -- 2,757,664 failures, all on the one scaled group,
-    while the unscaled groups in the same sub-batch succeeded.
     """
-    if dcp_world_size > 1 and any(
-        isinstance(_unwrap_spec(g.kv_cache_spec), AttentionSpec)
-        for g in kv_cache_groups
-    ):
-        return False
     return any(
         isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
         and spec.mamba_cache_mode == "align"

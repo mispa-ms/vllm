@@ -3,17 +3,13 @@
 
 from math import lcm
 
-import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
     ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
-    partial_hash_hits_enabled,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
-    ChunkedTokenDatabase,
-    KeyMetadata,
     chunk_hashes_for_block_size,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
@@ -34,13 +30,7 @@ def _mamba_align(block_size=32):
     )
 
 
-def _make_coord(
-    groups,
-    hash_block_size,
-    use_eagle=False,
-    retention_interval=None,
-    dcp_world_size=1,
-):
+def _make_coord(groups, hash_block_size, use_eagle=False, retention_interval=None):
     """Construct a coordinator using the natural LCM of group block sizes as
     the scheduler block size — mirrors ``resolve_kv_cache_block_sizes`` for
     the test fixtures."""
@@ -52,7 +42,6 @@ def _make_coord(
         hash_block_size=hash_block_size,
         use_eagle=use_eagle,
         retention_interval=retention_interval,
-        dcp_world_size=dcp_world_size,
     )
 
 
@@ -658,90 +647,3 @@ def test_dsv4_five_group_eagle_store_lookup_round_trip():
     # The final 256-token segment has no lookahead block, so EAGLE falls back
     # to the previous aligned boundary instead of consuming all 768 tokens.
     assert hit == 512
-
-
-# ----- DCP-scaled attention groups vs partial hash hits -----
-#
-# Under DCP, ``resolve_kv_cache_block_sizes`` scales attention groups by ``dcp``
-# and leaves Mamba alone, so attention becomes the COARSE group. A hash-aligned
-# hit length then ends mid-attention-block, and the store only holds whole
-# blocks: the load asks for a key the producer never wrote and Mooncake answers
-# OBJECT_NOT_FOUND (-704) forever, because ``kv_load_failure_policy=recompute``
-# reschedules the request instead of failing it.
-
-
-def _dcp_groups(dcp: int, mamba_block: int = 1536):
-    """Kimi-K3's shape: one MLA group scaled by dcp, one Mamba group not."""
-    return [
-        KVCacheGroupSpec(["L0"], _full(mamba_block * dcp)),
-        KVCacheGroupSpec(["L1"], _mamba_align(mamba_block)),
-    ]
-
-
-def _keys(db, token_len, hashes):
-    return {bytes(h) for _, _, h in db.process_tokens(token_len, hashes)}
-
-
-@pytest.mark.parametrize("dcp", [1, 2, 4, 8])
-def test_load_never_requests_a_key_the_producer_did_not_write(dcp):
-    """The invariant the -704 livelock violated.
-
-    The producer floors its save to ``lcm_block_size``; the consumer loads up to
-    ``align_lookup_length(hit)``. Every key the consumer asks for must be one the
-    producer wrote, for every group -- including one whose block size does not
-    divide the hit length.
-    """
-    hash_block_size = 128
-    groups = _dcp_groups(dcp)
-    coord = _make_coord(groups, hash_block_size, use_eagle=True, dcp_world_size=dcp)
-
-    # 64512 = 42 * 1536: aligned to the Mamba block and to hash_block_size, but
-    # not to the dcp-scaled attention block (64512 / 12288 = 5.25 at dcp=8).
-    raw_hit = 64512
-    hashes = [BlockHash(i.to_bytes(4, "big")) for i in range(raw_hit // hash_block_size)]
-
-    saved = raw_hit // coord.lcm_block_size * coord.lcm_block_size
-    loaded = coord.align_lookup_length(raw_hit)
-
-    for g in groups:
-        db = ChunkedTokenDatabase(
-            KeyMetadata("m", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0),
-            g.kv_cache_spec.block_size,
-            hash_block_size=hash_block_size,
-        )
-        missing = _keys(db, loaded, hashes) - _keys(db, saved, hashes)
-        assert not missing, (
-            f"dcp={dcp} block_size={g.kv_cache_spec.block_size}: load would "
-            f"request {len(missing)} key(s) the producer never wrote "
-            f"(saved={saved}, loaded={loaded})"
-        )
-
-
-@pytest.mark.parametrize("dcp", [2, 8])
-def test_partial_hash_hits_off_when_dcp_scales_an_attention_group(dcp):
-    hash_block_size = 128
-    assert not partial_hash_hits_enabled(_dcp_groups(dcp), hash_block_size, dcp)
-    # ... and still on for the same layout without DCP, so this does not change
-    # a path that already worked.
-    assert partial_hash_hits_enabled(_dcp_groups(1), hash_block_size, 1)
-    # Mamba-only is unaffected: DCP does not scale it.
-    mamba_only = [KVCacheGroupSpec(["L0"], _mamba_align(1536))]
-    assert partial_hash_hits_enabled(mamba_only, hash_block_size, dcp)
-
-
-@pytest.mark.parametrize("dcp", [2, 8])
-def test_scheduler_and_worker_group_lists_agree_on_partial_hash_hits(dcp):
-    """The scheduler passes the raw config, the worker its DCP-scaled copy.
-
-    They must reach the same answer -- a disagreement is what makes the
-    scheduler promise a hit length the worker cannot serve.
-    """
-    hash_block_size = 128
-    raw = [
-        KVCacheGroupSpec(["L0"], _full(1536)),
-        KVCacheGroupSpec(["L1"], _mamba_align(1536)),
-    ]
-    scaled = _dcp_groups(dcp)
-    assert partial_hash_hits_enabled(raw, hash_block_size, dcp) == (
-        partial_hash_hits_enabled(scaled, hash_block_size, dcp)
-    )
