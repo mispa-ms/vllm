@@ -1427,6 +1427,7 @@ class MooncakeStoreWorker:
             hash_block_size=self.hash_block_size,
             use_eagle=use_eagle,
             retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
+            dcp_world_size=vllm_config.parallel_config.decode_context_parallel_size,
         )
         # One ChunkedTokenDatabase per group; addresses populated in
         # register_kv_caches once the kv-cache layout is known. Each group's
