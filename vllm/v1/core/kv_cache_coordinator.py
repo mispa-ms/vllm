@@ -595,6 +595,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for g in kv_cache_config.kv_cache_groups
         )
 
+        # The drafting attention group rewinds a fine-grained hit by one hash
+        # unit. Mamba has no draft layer of its own, but its recurrent state
+        # must still exist at that reconciled replay boundary.
+        if self.eagle_group_ids and self.enable_partial_hash_hits:
+            for manager in self.single_type_managers:
+                if isinstance(manager, MambaManager):
+                    manager.cache_speculative_replay_tail = True
+
     @property
     def _cache_hit_alignment_tokens(self) -> int:
         # Fine-grained partial hits may return hash-block-aligned lengths;
@@ -655,14 +663,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if group.use_eagle:
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
-
-        # The drafting attention group rewinds a fine-grained hit by one hash
-        # unit. Mamba has no draft layer of its own, but its recurrent state
-        # must still exist at that reconciled replay boundary.
-        if self.eagle_group_ids and self.enable_partial_hash_hits:
-            for manager in self.single_type_managers:
-                if isinstance(manager, MambaManager):
-                    manager.cache_speculative_replay_tail = True
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         if self.enable_partial_hash_hits:
