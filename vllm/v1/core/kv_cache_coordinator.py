@@ -14,7 +14,6 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
-    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -594,14 +593,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
             for g in kv_cache_config.kv_cache_groups
         )
-
-        # The drafting attention group rewinds a fine-grained hit by one hash
-        # unit. Mamba has no draft layer of its own, but its recurrent state
-        # must still exist at that reconciled replay boundary.
-        if self.eagle_group_ids and self.enable_partial_hash_hits:
-            for manager in self.single_type_managers:
-                if isinstance(manager, MambaManager):
-                    manager.cache_speculative_replay_tail = True
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:

@@ -387,12 +387,11 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
 
         block_size = self.cache_config.block_size
-        # The last block-aligned position whose state can be cached. Without
-        # fine-grained hits, Eagle prunes the last matching block, so back off
-        # one block to avoid a Mamba cache miss. With a finer PMU, Eagle only
-        # rewinds one hash unit; keep the normal block boundary materialized.
+        # The last block-aligned position whose state can be cached. With
+        # Eagle, FullAttn prunes the last matching block, so back off one
+        # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle and not self.mamba_partial_cache_hit:
+        if self.use_eagle:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -416,25 +415,12 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
-        speculative_replay_boundary = (
-            tail_boundary - self.hash_block_size
-            if self.use_eagle and tail_boundary >= self.hash_block_size
-            else 0
-        )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary if start % block_size != 0 else 0,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
-            # EAGLE-family drafting rewinds a fine-grained attention hit by
-            # one hash unit. Materialize the matching recurrent state before
-            # proceeding to the latest prompt-tail boundary.
-            speculative_replay_boundary
-            if last_cache_position
-            < speculative_replay_boundary
-            < request.num_prompt_tokens
-            else 0,
             # Fine-grained hits: the prompt's partial-tail entry can only be
             # registered by a chunk ending exactly at its last hash boundary.
             tail_boundary
