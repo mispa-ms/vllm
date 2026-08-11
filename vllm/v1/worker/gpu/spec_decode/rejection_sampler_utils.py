@@ -532,6 +532,7 @@ def _rejection_kernel(
     # [num_logits, num_blocks]
     local_residual_mass_ptr,
     local_residual_mass_stride,
+    vocab_size,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
@@ -555,9 +556,15 @@ def _rejection_kernel(
         logit_idx = start_idx + i
         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
         # -1 is used for placeholder draft token ids that should be rejected.
-        is_valid_draft = draft_sampled >= 0
+        # Bounded above as well as below. Upstream guards only against the -1
+        # padding, but under synthetic acceptance draft_sampled is stored
+        # verbatim as an output token id rather than compared against
+        # target_argmax, so an out-of-vocab id survives to index the embedding
+        # table and trips `srcIndex < srcSelectDimSize` far from here. Every
+        # throughput arm on this track runs synthetic acceptance.
+        is_valid_draft = (draft_sampled >= 0) & (draft_sampled < vocab_size)
         # Avoid possible OOB ptr access.
-        draft_sampled = tl.maximum(0, draft_sampled)
+        draft_sampled = tl.minimum(tl.maximum(0, draft_sampled), vocab_size - 1)
         if not is_greedy:
             # A -1 placeholder ends verification. Greedy is excluded because it
             # stores the target argmax upon first rejection, so it rejects the
@@ -582,7 +589,17 @@ def _rejection_kernel(
                 )
                 if SYNTHETIC_MODE:
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
-                    accepted = u < rate
+                    # -1 is used for padded draft token ids that should be rejected.
+                    # The upper bound matters too: unlike the standard path
+                    # below, which only accepts a draft equal to target_argmax
+                    # (bounded by construction), synthetic acceptance stores
+                    # draft_sampled verbatim. An out-of-vocab id would then be
+                    # emitted as a sampled token and later index the embedding
+                    # table, tripping `srcIndex < srcSelectDimSize`. Rejecting
+                    # it falls back to target_argmax, which is in range.
+                    accepted &= (
+                        (u < rate) & (draft_sampled >= 0) & (draft_sampled < vocab_size)
+                    )
                 else:
                     accepted = target_argmax == draft_sampled
                 accepted &= is_valid_draft
@@ -1123,6 +1140,7 @@ def rejection_sample(
         cumulative_log_p,
         local_residual_mass,
         local_residual_mass.stride(0) if local_residual_mass is not None else 0,
+        vocab_size,
         vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
