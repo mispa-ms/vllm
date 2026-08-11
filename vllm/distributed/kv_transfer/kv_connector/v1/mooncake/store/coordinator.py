@@ -167,6 +167,33 @@ class MooncakeStoreCoordinator:
         already reflects the eagle-pruned hit length and a second pop would
         leave the trailing block unloaded.
         """
+        # A producer with fine-grained EAGLE caching persists the already
+        # reconciled replay boundary (one hash unit back), so resume there
+        # instead of taking a redundant lookahead snapshot.
+        if apply_eagle and self.enable_partial_hash_hits and self.eagle_group_ids:
+            latest_boundary = max_length // self.hash_block_size * self.hash_block_size
+            replay_boundary = latest_boundary - self.hash_block_size
+            if replay_boundary > 0:
+                replay_blocks, replay_hit = self._find_hit_blocks(
+                    block_hashes,
+                    replay_boundary,
+                    cached_block_pool,
+                    apply_eagle=False,
+                )
+                # Revalidate exactly as the loop below does: a hash-unit
+                # boundary is not a block boundary and Mooncake keys whole
+                # blocks, so returning here unchecked reintroduces -704.
+                if replay_hit == replay_boundary and self._exact_partial_hit_key_exists(
+                    block_hashes, replay_hit, cached_block_pool
+                ):
+                    return (
+                        tuple(
+                            [blk is not cached_block_pool.null_block for blk in blocks]
+                            for blocks in replay_blocks
+                        ),
+                        replay_hit,
+                    )
+
         candidate_length = max_length
         while True:
             blocks_per_group, hit_length = self._find_hit_blocks(
