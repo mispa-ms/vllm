@@ -589,17 +589,7 @@ def _rejection_kernel(
                 )
                 if SYNTHETIC_MODE:
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
-                    # -1 is used for padded draft token ids that should be rejected.
-                    # The upper bound matters too: unlike the standard path
-                    # below, which only accepts a draft equal to target_argmax
-                    # (bounded by construction), synthetic acceptance stores
-                    # draft_sampled verbatim. An out-of-vocab id would then be
-                    # emitted as a sampled token and later index the embedding
-                    # table, tripping `srcIndex < srcSelectDimSize`. Rejecting
-                    # it falls back to target_argmax, which is in range.
-                    accepted &= (
-                        (u < rate) & (draft_sampled >= 0) & (draft_sampled < vocab_size)
-                    )
+                    accepted = u < rate
                 else:
                     accepted = target_argmax == draft_sampled
                 accepted &= is_valid_draft
