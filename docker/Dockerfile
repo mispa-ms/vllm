@@ -129,7 +129,10 @@ ENV VIRTUAL_ENV="/opt/venv"
 # install below fails with "Unable to find a match: ccache". Enabling it is a
 # no-op where it is already on.
 RUN dnf install -y epel-release || true
-RUN dnf install -y --setopt=install_weak_deps=False \
+# --allowerasing: the multi-arch bases ship curl-minimal, which conflicts with
+# the full curl requested below; dnf refuses rather than swapping. Harmless on
+# the manylinux base, where nothing conflicts.
+RUN dnf install -y --allowerasing --setopt=install_weak_deps=False \
         ccache \
         git \
         curl \
