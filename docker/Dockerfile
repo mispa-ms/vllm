@@ -122,6 +122,13 @@ ENV VIRTUAL_ENV="/opt/venv"
 
 # Install system dependencies including build tools. The PyTorch manylinux
 # image enables EPEL, which provides ccache.
+#
+# That image is amd64-only, so an aarch64 build has to pass a different
+# BUILD_BASE_IMAGE (nvidia/cuda:*-rockylinux9 is dnf-based and multi-arch) and
+# such a base does not have EPEL enabled -- ccache is then simply absent and the
+# install below fails with "Unable to find a match: ccache". Enabling it is a
+# no-op where it is already on.
+RUN dnf install -y epel-release || true
 RUN dnf install -y --setopt=install_weak_deps=False \
         ccache \
         git \
