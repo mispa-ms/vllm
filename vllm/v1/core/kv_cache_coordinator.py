@@ -740,11 +740,25 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 num_finalized_computed_tokens = max(
                     0, num_computed_tokens - self.num_reprefillable_tokens
                 )
-                aligned_num_finalized_computed_tokens = (
-                    num_finalized_computed_tokens
-                    // self.scheduler_block_size
-                    * self.scheduler_block_size
-                )
+                # vllm#50062 re-derives this alignment from scratch instead of
+                # reusing aligned_num_computed_tokens above, which silently
+                # undoes the fine-grained path: when partial hash hits are on
+                # (hybrid Mamba group, our #50493 carry) that value is
+                # deliberately NOT floor-aligned, and flooring it here caps what
+                # may be cached at floor(n/sched_bs)*sched_bs + block_size
+                # instead of n. Only EAGLE-family groups take this branch, which
+                # is why it costs DSpark 7.4% at c8 and 13.8% at c16 with GPU
+                # prefix hit down 8.5 points, and costs no-spec nothing.
+                if self.enable_partial_hash_hits:
+                    aligned_num_finalized_computed_tokens = (
+                        num_finalized_computed_tokens
+                    )
+                else:
+                    aligned_num_finalized_computed_tokens = (
+                        num_finalized_computed_tokens
+                        // self.scheduler_block_size
+                        * self.scheduler_block_size
+                    )
                 num_tokens_to_cache = min(
                     num_finalized_computed_tokens,
                     aligned_num_finalized_computed_tokens + manager.block_size,
