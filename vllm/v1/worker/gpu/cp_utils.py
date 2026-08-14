@@ -71,7 +71,15 @@ def cp_local_slot(
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
 ):
-    """Return rank-local KV slots, or PAD_ID for positions not owned by this rank."""
+    """KV slot for `positions` on this CP rank, or PAD_ID if not owned here.
+
+    DCP distributes a sequence round-robin over the CP ranks in chunks of
+    CP_INTERLEAVE, so a token's rank-local offset is not its global offset.
+    At CP_SIZE == 1 this reduces to the non-CP expression exactly.
+
+    `block_numbers` must have been loaded with the matching block index,
+    `positions // (block_size * CP_SIZE)`.
+    """
     block_offsets = positions % (block_size * CP_SIZE)
     if CP_SIZE == 1:
         return block_numbers * block_size + block_offsets

@@ -42,6 +42,10 @@ def _prepare_dflash_inputs_to_capture(
     attn_metadata = None
     if not skip_attn:
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+        # The draft has two independent metadata paths -- this one for capture
+        # and DFlashSpeculator._build_draft_attn_metadata for serving. Only the
+        # serving one was DCP-aware, so build() dereferenced a None
+        # dcp_local_seq_lens during capture.
         dcp_local_seq_lens = None
         if block_tables.cp_size > 1:
             prepare_dcp_local_seq_lens(
