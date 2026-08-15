@@ -1508,6 +1508,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
             )
+            # Same DCP handling as create_dummy_attn_state: make_dummy leaves
+            # dcp_local_seq_lens unset, but the MLA metadata builder swaps it
+            # in for seq_lens whenever DCP is enabled.
+            if self.use_dcp:
+                prepare_dcp_local_seq_lens(
+                    self.input_buffers.dcp_local_seq_lens,
+                    input_batch.seq_lens,
+                    dummy_num_reqs,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    self.cp_interleave,
+                )
+                input_batch.dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[
+                    :dummy_num_reqs
+                ]
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
                 if context_len:
