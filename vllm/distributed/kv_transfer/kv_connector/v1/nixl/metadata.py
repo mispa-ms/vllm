@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Metadata dataclasses and helpers for the NIXL connector."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -43,8 +43,10 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #      clock-sync timestamp
 #   6: Validate EAGLE/MTP speculative configuration compatibility
 #   7: Include NIXL transfer mode (push vs pull) in the compatibility hash
+#   8: Add per-region member names for PP push.
+#   9: Add packed-member offsets and block strides for PP push.
 #
-NIXL_CONNECTOR_VERSION: int = 7
+NIXL_CONNECTOR_VERSION: int = 9
 
 
 @dataclass
@@ -60,6 +62,11 @@ class NixlAgentMetadata:
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
     physical_blocks_per_logical_kv_block: int
+    # Layer names sharing each advertised region, in region order.
+    region_members: list[list[str]] = field(default_factory=list)
+    # Single-region packed layout; zero/empty for contiguous regions.
+    packed_block_stride: int = 0
+    packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 @dataclass
