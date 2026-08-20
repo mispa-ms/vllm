@@ -1549,10 +1549,17 @@ class EagleModelMixin:
         out: list[torch.Tensor] = []
         # IntermediateTensors has no __contains__, so consult the dict directly.
         payload = intermediate_tensors.tensors
-        for i in range(self.num_upstream_aux_hidden_states()):
+        expected = self.num_upstream_aux_hidden_states()
+        for i in range(expected):
             key = f"{self.AUX_HIDDEN_STATE_KEY}{i}"
-            if key not in payload:
-                break
+            # Both sides size themselves from num_upstream_aux_hidden_states, so
+            # a missing key means send and recv disagree. Returning the short
+            # list instead would hand the drafter fewer taps than it was built
+            # for, with no error anywhere.
+            assert key in payload, (
+                f"Expected {expected} upstream aux hidden states but {key} is "
+                f"missing; got {sorted(payload)}"
+            )
             out.append(payload[key])
         return out
 
