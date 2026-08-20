@@ -1030,6 +1030,24 @@ class TestPushPipelineParallel:
         assert request_id in w._recving_transfers
         assert request_id not in w.consumer_notification_counts_by_req
 
+    def test_pp_sharded_consumer_is_refused_even_under_kv_both(self):
+        """The notif count models the producer's pp_size, never our own.
+
+        The __init__ guard for decode-side PP tests `kv_role == "kv_consumer"`,
+        which `kv_both` does not match although it means both roles, so a
+        kv_both decode instance reaches this path unguarded and would settle
+        requests on the wrong notif count.
+        """
+        w = _StubWriterWorker.fresh()
+        w.transfer_topo = MagicMock()
+        w.pp_size = 2
+        request_id = "req-pp-consumer"
+        w._recving_metadata[request_id] = MagicMock(pp_size=1)
+        w._pending_completion_notifs.put(f"{request_id}:1".encode())
+
+        with pytest.raises(AssertionError, match="pipeline_parallel_size > 1"):
+            w._get_new_notifs()
+
     def test_req_meta_reads_pp_size_from_kv_transfer_params(self):
         """D learns the producer's pp_size from kv_transfer_params (forwarded
         by the proxy) and defaults to 1 when absent."""
