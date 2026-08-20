@@ -25,8 +25,8 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from types import SimpleNamespace
 from concurrent.futures import Future
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 

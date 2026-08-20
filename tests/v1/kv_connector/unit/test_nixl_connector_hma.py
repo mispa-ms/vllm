@@ -1539,6 +1539,9 @@ def test_register_kv_caches_hybrid_mla_dual_purpose_regions():
     kv_cache_config = _make_hybrid_mla_kv_cache_config()
     unified_page = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
     vllm_config = create_vllm_config(block_size=12)
+    # Left at None, VllmConfig resolves this to True for the opt-125m test
+    # config, and the worker then asserts _is_hma_required under _has_mamba.
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
     # kv_buffer_device defaults to the *real* platform's device type, which on
     # a CPU-only test host would make this a host-buffer worker: host xfer
     # buffers are per-layer, so the HMA shared tensors would not be
@@ -1599,6 +1602,80 @@ def test_register_kv_caches_hybrid_mla_dual_purpose_regions():
     fa_descs = worker.src_blocks_data[:24]
     assert fa_descs[1][0] - fa_descs[0][0] == unified_page // 3
     assert all(size == unified_page // 3 for size in fa_descs[:, 1])
+
+
+@pytest.mark.cpu_test
+def test_pp_push_hybrid_mla_registration_advertises_members():
+    """A PP-sharded push producer over a Mamba/SSM hybrid must advertise the
+    layer names backing each region.
+
+    ``_requires_member_identity`` routes this worker by layer name, and a peer
+    that receives ``region_members == []`` raises rather than transfer stale
+    KV. The two gates were once separate expressions and drifted, leaving every
+    K3 PP arm unstartable; only registration shows that, so this goes through
+    ``register_kv_caches`` rather than asserting the predicate.
+    """
+    from unittest.mock import MagicMock
+
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
+        NixlPushConnectorWorker,
+    )
+
+    kv_cache_config = _make_hybrid_mla_kv_cache_config()
+    unified_page = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+    vllm_config = create_vllm_config(
+        block_size=12, kv_connector="NixlPushConnector", kv_role="kv_producer"
+    )
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    vllm_config.parallel_config.pipeline_parallel_size = 2
+    vllm_config.kv_transfer_config.kv_buffer_device = "cuda"
+
+    fake_backend = MagicMock()
+    fake_backend.get_supported_kernel_block_sizes.return_value = [4]
+    fake_backend.get_name.return_value = "FLASHMLA"
+    fake_backend.full_cls_name.return_value = "fake.FLASHMLA"
+    fake_platform = MagicMock()
+    fake_platform.device_type = "cuda"
+    fake_platform.get_nixl_memory_type.return_value = "VRAM"
+
+    with (
+        patch.object(bw, "NixlWrapper"),
+        patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+        patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
+        patch.object(bw, "current_platform", fake_platform),
+        patch(
+            "vllm.model_executor.layers.mamba.mamba_utils.get_conv_state_layout",
+            return_value="DS",
+        ),
+        set_current_vllm_config(vllm_config),
+    ):
+        worker = NixlPushConnectorWorker(vllm_config, "test-engine", kv_cache_config)
+        worker.use_mla = True
+        worker.nixl_wrapper.get_agent_metadata.return_value = b"fake-agent-metadata"
+
+        tensors = [torch.zeros(4 * unified_page, dtype=torch.uint8) for _ in range(2)]
+        worker.register_kv_caches(
+            {
+                "kda_a.0": tensors[0],
+                "mla.0": tensors[0],
+                "kda_b.0": tensors[0],
+                "kda_a.1": tensors[1],
+                "mla.1": tensors[1],
+                "kda_b.1": tensors[1],
+            }
+        )
+
+    assert worker._requires_member_identity()
+    # One pooled region per tensor, each backing an MLA layer and two KDA
+    # layers. Empty here is the failure that made K3 PP unstartable.
+    assert worker.region_members == [
+        ["kda_a.0", "mla.0", "kda_b.0"],
+        ["kda_a.1", "mla.1", "kda_b.1"],
+    ]
+    assert len(worker.region_members) == worker.num_regions
 
 
 @pytest.mark.cpu_test
