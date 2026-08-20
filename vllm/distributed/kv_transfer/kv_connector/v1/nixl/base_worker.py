@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cached_property
@@ -422,19 +422,48 @@ class NixlBaseConnectorWorker:
         """
         return self._supports_member_identity and self._is_hma_required
 
-    def _requires_member_identity(self) -> bool:
-        """Whether this worker's local layout must be routed by layer name.
+    def _requires_member_identity(
+        self, remote_region_members: Sequence[Sequence[str]] = ()
+    ) -> bool:
+        """Whether transfers to this peer must be routed by layer name.
 
-        True for a PP-sharded push producer whose local KV layout is hybrid
-        (HMA) or packed: region indices are not a stable identity across the
-        P/D layer split, so transfers must be keyed by member name. Independent
-        of the remote peer.
+        Region indices identify a region only relative to the layer set that
+        produced them, so they stop being a shared identity as soon as the two
+        sides hold different layer sets. That is a property of the *pair*, not
+        of us: a PP=1 producer writing to a PP-sharded consumer has the same
+        problem as a PP-sharded producer, because the consumer's stage holds a
+        subset of our layers at region indices that mean something else.
+
+        Checking only ``self.pp_size`` -- as this did -- silently left the
+        PP=1 x PP>1 direction on region-index routing, where it fails the
+        descriptor-count check or, past it, transfers the wrong layers.
+
+        With no remote members advertised the answer is the local one: an old
+        peer that cannot describe its members is one we could not member-route
+        to anyway.
         """
-        return (
-            self._supports_member_identity
-            and self.pp_size > 1
-            and (self._is_hma_required or bool(self._packed_layer_info))
-        )
+        if not self._supports_member_identity:
+            return False
+        if not (self._is_hma_required or bool(self._packed_layer_info)):
+            return False
+        if self.pp_size > 1:
+            return True
+        return self._peer_layer_set_differs(remote_region_members)
+
+    def _peer_layer_set_differs(
+        self, remote_region_members: Sequence[Sequence[str]]
+    ) -> bool:
+        """Whether the peer advertised a different set of KV layers than ours.
+
+        Identical sets mean the two sides partitioned the model the same way and
+        region indices line up, which is the long-standing TP-only case; leaving
+        it on region-index routing keeps that path untouched.
+        """
+        if not remote_region_members:
+            return False
+        remote = {name for members in remote_region_members for name in members}
+        local = {name for members in self.region_members for name in members}
+        return bool(local) and remote != local
 
     def _use_member_identity(self, nixl_agent_meta: NixlAgentMetadata) -> bool:
         """Whether to route this remote's regions by layer name.
@@ -446,7 +475,7 @@ class NixlBaseConnectorWorker:
                 with ``enforce_handshake_compat=false``; falling back to
                 region-index routing here would silently transfer stale KV.
         """
-        if not self._requires_member_identity():
+        if not self._requires_member_identity(nixl_agent_meta.region_members):
             return False
         if not nixl_agent_meta.region_members:
             raise RuntimeError(
@@ -942,7 +971,17 @@ class NixlBaseConnectorWorker:
         # could address, and planning a member transfer against it raises rather
         # than yielding an empty plan. Same rule the transfer and the notif
         # count use, so a stage we skip here is one we never write to or wait on.
-        remote_pp_ranks = self._overlapping_remote_pp_ranks(remote_pp_size)
+        #
+        # Notif-only registration is exempt. It skips descriptor setup entirely,
+        # so it never plans a member transfer and cannot hit that failure -- the
+        # reason for filtering does not apply, and knowing every stage's agent
+        # name costs nothing. Leaving this path alone also keeps heartbeat
+        # discovery of a PP-sharded producer exactly as it was.
+        remote_pp_ranks = (
+            list(range(remote_pp_size))
+            if notif_agents_only
+            else self._overlapping_remote_pp_ranks(remote_pp_size)
+        )
         with zmq_ctx(zmq.REQ, path) as sock:
             for remote_pp_rank, remote_rank in itertools.product(
                 remote_pp_ranks, p_remote_ranks

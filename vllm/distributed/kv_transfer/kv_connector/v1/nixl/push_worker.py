@@ -541,7 +541,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             )
         else:
             tp_targets = list(plan.all_source_ranks)
-        write_ranks = [(stage, tp) for stage in write_stages for tp in tp_targets]
+        # Carry the TP *index* alongside the rank: the local split handles are
+        # one per TP target, so indexing them by position in this list would
+        # run off the end as soon as there is more than one decode stage.
+        write_ranks = [
+            (stage, tp_index, tp)
+            for stage in write_stages
+            for tp_index, tp in enumerate(tp_targets)
+        ]
 
         def group_ids(block_ids: BlockIds, rank: int) -> BlockIds:
             return [
@@ -558,12 +565,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 local_block_ids=group_ids(local_block_ids, tp),
                 remote_block_ids=group_ids(remote_block_ids, tp),
             )
-            for (_stage, tp) in write_ranks
+            for (_stage, _tp_index, tp) in write_ranks
         ]
 
         handles: list[int] = []
-        for i, spec in enumerate(read_specs):
-            remote_pp_rank = write_ranks[i][0]
+        for (remote_pp_rank, tp_index, _tp), spec in zip(write_ranks, read_specs):
             member_state = self._member_xfer_state.get((engine_id, remote_pp_rank))
             member_groups = (
                 member_state.plan.group_ids if member_state is not None else None
@@ -584,7 +590,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 # Hybrid MLA+SSM also lands here: its split handles replicate
                 # the attention descriptors and chunk only the SSM state.
                 split_key = (tp_ratio, remote_block_size)
-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][i]
+                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][
+                    tp_index
+                ]
             else:
                 local_xfer_side_handle = self.src_xfer_handles_by_block_size[
                     remote_block_size

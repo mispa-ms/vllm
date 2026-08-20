@@ -1529,15 +1529,19 @@ class TestMemberGatesAgree:
         w._has_mamba = mamba
         w.pp_size = pp
         w._packed_layer_info = {"l0": (0, 128)} if packed else {}
+        w.region_members = [["l0"], ["l1"]]
         return w
 
     @pytest.mark.parametrize("hma", [True, False])
     @pytest.mark.parametrize("mamba", [True, False])
     @pytest.mark.parametrize("pp", [1, 2])
     @pytest.mark.parametrize("packed", [True, False])
-    def test_routing_implies_advertising(self, hma, mamba, pp, packed):
+    @pytest.mark.parametrize(
+        "remote_members", [(), (["l0"], ["l1"]), (["l0"],)], ids=["none", "same", "cut"]
+    )
+    def test_routing_implies_advertising(self, hma, mamba, pp, packed, remote_members):
         w = self._worker(hma=hma, mamba=mamba, pp=pp, packed=packed)
-        if w._requires_member_identity() and not packed:
+        if w._requires_member_identity(remote_members) and not packed:
             # Packed registration advertises members through its own path
             # (_register_packed_kv_cache), so only the pooled path is covered here.
             assert w._tracks_region_members()
@@ -1639,3 +1643,64 @@ class TestDecodePipelineParallel:
                 and me[0] < get_pp_indices(num_layers, stage, remote_pp)[1]
             )
         assert all(c >= 1 for c in claims), f"unclaimed producer stage: {claims}"
+
+
+class TestMemberIdentityAcrossPeerSplit:
+    """A PP=1 producer still needs member routing when the consumer is sharded.
+
+    Region indices identify a region only against the layer set that produced
+    them. The gate used to read `self.pp_size` alone, which left the
+    PP=1 x PP>1 direction on region-index routing -- the descriptor counts do
+    not match (93 layers against a stage's ~47), and past that check it would
+    address the wrong layers.
+    """
+
+    @staticmethod
+    def _producer(local_members):
+        w = _StubWriterWorker.fresh()
+        w._is_hma_required = True
+        w._has_mamba = True
+        w.pp_size = 1
+        w._packed_layer_info = {}
+        w.region_members = local_members
+        return w
+
+    def test_sharded_peer_turns_member_routing_on(self):
+        w = self._producer([[f"layer.{i}"] for i in range(4)])
+        # The consumer's stage 0 holds the first half of the model.
+        assert w._requires_member_identity([["layer.0"], ["layer.1"]])
+
+    def test_matching_peer_leaves_region_routing_alone(self):
+        """The TP-only case, which must not change behaviour."""
+        members = [[f"layer.{i}"] for i in range(4)]
+        w = self._producer(members)
+        assert not w._requires_member_identity([list(m) for m in members])
+
+    def test_silent_peer_falls_back_to_the_local_answer(self):
+        """A peer too old to advertise members is one we cannot member-route to."""
+        w = self._producer([["layer.0"], ["layer.1"]])
+        assert not w._requires_member_identity(())
+
+
+class TestWriteHandleIndexing:
+    """Local split handles are per TP target, not per (stage, TP) pair.
+
+    Indexing them by position in the write list ran off the end as soon as a
+    second decode stage appeared -- an IndexError on the first request of any
+    PP-sharded-consumer arm that was not using member routing.
+    """
+
+    def test_split_handle_index_stays_within_the_tp_targets(self):
+        write_stages = [0, 1]
+        tp_targets = [0, 1, 2, 3]
+        write_ranks = [
+            (stage, tp_index, tp)
+            for stage in write_stages
+            for tp_index, tp in enumerate(tp_targets)
+        ]
+        assert len(write_ranks) == len(write_stages) * len(tp_targets)
+        assert max(tp_index for _s, tp_index, _tp in write_ranks) == len(tp_targets) - 1
+        # And each stage still covers every TP target exactly once.
+        for stage in write_stages:
+            covered = [tp for s, _i, tp in write_ranks if s == stage]
+            assert covered == tp_targets

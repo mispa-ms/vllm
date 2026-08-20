@@ -193,3 +193,58 @@ def test_plan_member_transfer_rejects_mixed_packed_layouts(
             local_packed_layouts={"L0": (0, 128)} if local_packed else None,
             local_block_stride=128 if local_packed else 0,
         )
+
+
+class TestNonOverlappingStagesAreNotPlannable:
+    """Why the handshake filters stages instead of tolerating the miss.
+
+    ``plan_member_transfer`` raises when the remote metadata does not name a
+    layer we own, which is exactly the shape of a decode stage holding the other
+    half of the model. There is no empty-plan path to fall through to, so a
+    handshake that queries every stage is a startup crash rather than wasted
+    work. These are the K3 proportions: 93 layers, split by ``get_pp_indices``.
+    """
+
+    LAYERS = [f"layer.{i}" for i in range(93)]
+
+    @classmethod
+    def _stage(cls, rank, size):
+        from vllm.distributed.utils import get_pp_indices
+
+        start, end = get_pp_indices(len(cls.LAYERS), rank, size)
+        return cls.LAYERS[start:end]
+
+    def _plan(self, local_layers, remote_layers):
+        meta = NixlAgentMetadata(
+            engine_id="remote",
+            agent_metadata=b"",
+            kv_caches_base_addr=[0] * len(remote_layers),
+            device_id=0,
+            num_blocks=1,
+            block_lens=[128] * len(remote_layers),
+            kv_cache_layout="HND",
+            block_size=16,
+            ssm_sizes=(0, 0),
+            attn_backend_name="FLASH_ATTN",
+            physical_blocks_per_logical_kv_block=1,
+            region_members=[[name] for name in remote_layers],
+        )
+        return plan_member_transfer(
+            meta,
+            [[name] for name in local_layers],
+            {name: 0 for name in local_layers},
+        )
+
+    def test_full_overlap_plans(self):
+        stage = self._stage(0, 2)
+        _meta, plan = self._plan(stage, stage)
+        assert plan.member_names == tuple(stage)
+
+    def test_disjoint_stage_raises(self):
+        with pytest.raises(RuntimeError, match="missing locally owned KV cache"):
+            self._plan(self._stage(0, 2), self._stage(1, 2))
+
+    def test_partial_overlap_raises(self):
+        """P_PP2 s0 against D_PP4 s0: D holds a strict subset of P's window."""
+        with pytest.raises(RuntimeError, match="missing locally owned KV cache"):
+            self._plan(self._stage(0, 2), self._stage(0, 4))
