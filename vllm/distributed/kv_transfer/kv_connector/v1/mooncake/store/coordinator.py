@@ -98,6 +98,19 @@ class MooncakeStoreCoordinator:
         )
         return length // alignment * alignment
 
+    def get_replay_boundary(self, num_prompt_tokens: int) -> int:
+        """Mirror of ``KVCacheCoordinator.get_replay_boundary``.
+
+        The store's retention must name the same position the engine resumes
+        at; if the two disagree the store keeps state where nothing can reach
+        it. Model-level for the same reason: a hit is the shortest hit across
+        groups, so an EAGLE group's drop caps every group.
+        """
+        if not self.eagle_group_ids:
+            return num_prompt_tokens - 1
+        aligned = num_prompt_tokens // self.lcm_block_size * self.lcm_block_size
+        return max(aligned - self.lcm_block_size, 0)
+
     def _verify_and_split_kv_cache_groups(self) -> None:
         """Mirrors KVCacheCoordinator.verify_and_split_kv_cache_groups but
         dispatches via spec_manager_map (we don't allocate managers).
@@ -132,6 +145,18 @@ class MooncakeStoreCoordinator:
         # group sharing the spec.
         self.eagle_group_ids = {
             gid for g in attention_groups if g.use_eagle for gid in g.group_ids
+        }
+        self.eagle_proof_units = {
+            gid: (
+                self.hash_block_size
+                if self.enable_partial_hash_hits
+                and g.manager_cls.supports_fine_grained_hash_lookup
+                and g.spec.block_size > self.hash_block_size
+                else g.spec.block_size
+            )
+            for g in attention_groups
+            if g.use_eagle and not isinstance(g.spec, MambaSpec)
+            for gid in g.group_ids
         }
 
     def find_longest_cache_hit(
@@ -240,6 +265,13 @@ class MooncakeStoreCoordinator:
             f"aligned_token_len ({aligned_token_len}) must be a multiple of "
             f"{mask_alignment}"
         )
+        # Model-level, so it is computed once and shared by every group (see
+        # KVCacheCoordinator.get_replay_boundary).
+        reachable_boundaries = (
+            ()
+            if num_prompt_tokens is None
+            else (self.get_replay_boundary(num_prompt_tokens),)
+        )
         masks: list[list[bool] | None] = []
         for g_idx, g in enumerate(self.kv_cache_groups):
             spec = _unwrap_spec(g.kv_cache_spec)
@@ -248,9 +280,6 @@ class MooncakeStoreCoordinator:
             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
             assert manager_cls is not None
             use_eagle = g_idx in self.eagle_group_ids
-            reachable_boundaries = (
-                () if num_prompt_tokens is None else (num_prompt_tokens - 1,)
-            )
             mask = manager_cls.reachable_block_mask(
                 start_block=start_chunk,
                 end_block=end_chunk,

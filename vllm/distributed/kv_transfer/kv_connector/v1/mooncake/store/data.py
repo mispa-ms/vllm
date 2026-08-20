@@ -367,6 +367,7 @@ class ReqMeta:
 
     token_ids: list[int] | None = None
     num_prompt_tokens: int | None = None
+    num_computed_tokens: int | None = None
     # Identifies this store job for the engine's lifetime. A request id cannot
     # serve that purpose: it is reused once a preempted request resumes, so it
     # would release the wrong job's blocks.
@@ -436,6 +437,7 @@ class ReqMeta:
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
             num_prompt_tokens=tracker.prefill_end_tokens,
+            num_computed_tokens=tracker.token_len,
         )
 
 

@@ -107,7 +107,6 @@ class SingleTypeKVCacheManager(ABC):
         # aligned segment (SWA). Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
-
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
@@ -133,9 +132,17 @@ class SingleTypeKVCacheManager(ABC):
     ) -> bool:
         # The local prefix-cache hit ends inside one of this manager's
         # blocks: the shared tail block needs CoW.
+        if num_local_computed_tokens % self.block_size == 0:
+            return False
+        block_idx = num_local_computed_tokens // self.block_size
+        if block_idx >= len(new_computed_blocks):
+            return False
+        boundary_block = new_computed_blocks[block_idx]
+        cached_boundary = boundary_block.block_hash_num_tokens
         return (
-            len(new_computed_blocks) > 0
-            and num_local_computed_tokens % self.block_size != 0
+            not boundary_block.is_null
+            and cached_boundary is not None
+            and cached_boundary >= num_local_computed_tokens
         )
 
     def get_num_blocks_to_allocate(
@@ -277,12 +284,12 @@ class SingleTypeKVCacheManager(ABC):
         # them so cache_blocks() will not try to re-cache blocks that already
         # have a block_hash set.
         self.num_cached_block[request_id] = len(req_blocks)
-        if self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens):
+        if self._has_partial_local_hit(req_blocks, num_local_computed_tokens):
             # Record the partial tail for the CoW redirect in
             # allocate_new_blocks; cap the cached count at the full blocks so
             # cache_blocks() re-caches the private copy once full.
             block_idx = num_local_computed_tokens // self.block_size
-            self._partial_hit_reqs[request_id] = (block_idx, new_computed_blocks[-1])
+            self._partial_hit_reqs[request_id] = (block_idx, req_blocks[block_idx])
             self.num_cached_block[request_id] = block_idx
 
     def allocate_external_computed_blocks(
@@ -317,9 +324,11 @@ class SingleTypeKVCacheManager(ABC):
             return
 
         req_blocks = self.req_to_blocks[request_id]
-        allocated_blocks = self.block_pool.get_new_blocks(
-            cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+        num_blocks_to_allocate = max(
+            0,
+            cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks),
         )
+        allocated_blocks = self.block_pool.get_new_blocks(num_blocks_to_allocate)
         req_blocks.extend(allocated_blocks)
         if self._record_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
@@ -414,18 +423,28 @@ class SingleTypeKVCacheManager(ABC):
         request.
         """
         req_blocks = self.req_to_blocks[request_id]
-        assert block_idx < len(req_blocks)
-        assert req_blocks[block_idx] is source_block
+        assert block_idx < len(req_blocks), (
+            f"request={request_id}, group={self.kv_cache_group_id}, "
+            f"block_idx={block_idx}, num_blocks={len(req_blocks)}, "
+            f"source={source_block.block_id}"
+        )
+        assert req_blocks[block_idx] is source_block, (
+            f"request={request_id}, group={self.kv_cache_group_id}, "
+            f"block_idx={block_idx}, actual={req_blocks[block_idx].block_id}, "
+            f"source={source_block.block_id}, source_ref={source_block.ref_cnt}"
+        )
         assert not source_block.is_null and source_block.ref_cnt > 0
         req_blocks[block_idx] = cow_block
         self._pending_cow_copies.append((source_block, cow_block))
-        cow_block.ref_cnt += 1
+        self.block_pool.touch((cow_block,))
 
     def cache_blocks(
         self,
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
         """
         Cache the blocks for the request.
@@ -448,7 +467,7 @@ class SingleTypeKVCacheManager(ABC):
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
         # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries = [request.num_prompt_tokens - 1]
+        reachable_boundaries = [replay_boundary]
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
@@ -783,8 +802,15 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundary=replay_boundary,
+        )
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
@@ -1637,7 +1663,7 @@ class MambaManager(SingleTypeKVCacheManager):
                         assert req_blocks[block_idx] is source_block
                         self.block_pool.move_block_hashes(source_block, cow_block)
                         self._pending_cow_copies.append((source_block, cow_block))
-                        source_block.ref_cnt += 1
+                        self.block_pool.touch((source_block,))
                         boundary_tokens = self._producer_partial_tail_reqs.pop(
                             request_id, None
                         )
@@ -1693,9 +1719,16 @@ class MambaManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundary=replay_boundary,
+        )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
@@ -1731,6 +1764,12 @@ class MambaManager(SingleTypeKVCacheManager):
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
+        if self.use_eagle:
+            # Eagle groups match one hash unit past the candidate and drop it,
+            # so register the tail one unit lower.
+            latest_prompt_hash_boundary = max(
+                latest_prompt_hash_boundary - hash_block_size, 0
+            )
         if num_tokens != latest_prompt_hash_boundary:
             return None
 
@@ -1788,6 +1827,8 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.

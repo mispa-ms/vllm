@@ -390,11 +390,12 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
 
         block_size = self.cache_config.block_size
-        # The last block-aligned position whose state can be cached. With
-        # Eagle, FullAttn prunes the last matching block, so back off one
-        # block to avoid a Mamba cache miss.
+        # The last block-aligned position whose state can be cached. Without
+        # fine-grained hits, Eagle prunes the last matching block, so back off
+        # one block to avoid a Mamba cache miss. With a finer PMU, Eagle only
+        # rewinds one hash unit; keep the normal block boundary materialized.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if self.use_eagle and not self.mamba_partial_cache_hit:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -418,16 +419,28 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
+        speculative_replay_boundary = (
+            tail_boundary - self.hash_block_size
+            if self.use_eagle and tail_boundary >= self.hash_block_size
+            else 0
+        )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary if start % block_size != 0 else 0,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
-            # Fine-grained hits: the prompt's partial-tail entry can only be
-            # registered by a chunk ending exactly at its last hash boundary.
+            # DSpark/EAGLE rewinds a fine-grained attention hit by one hash
+            # unit. Materialize the matching recurrent state before advancing
+            # to the lookahead boundary.
+            speculative_replay_boundary
+            if speculative_replay_boundary < request.num_prompt_tokens
+            else 0,
+            # Without speculative lookahead, the partial-tail state itself is
+            # the reusable checkpoint.
             tail_boundary
-            if last_cache_position < tail_boundary < request.num_prompt_tokens
+            if not self.use_eagle
+            and last_cache_position < tail_boundary < request.num_prompt_tokens
             else 0,
             # Marconi shared-prefix junction, block-floored (a sub-block
             # junction's state is not separately cacheable): cache its state
@@ -2870,8 +2883,16 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            # get_block_ids returns one block-id list per KV-cache group.
+            # Hybrid models (e.g. Mamba + attention) expose several groups; in
+            # align mode they share the scheduler block_size and block count,
+            # and block_ids are globally unique. Scan by logical position and
+            # treat a position as invalid if ANY group's block there failed to
+            # load, truncating the request at the earliest such position.
+            # (Previously this unpacked a single group -- ``(req_block_ids,) =
+            # ...`` -- and crashed hybrid models with a failed external KV load
+            # via "ValueError: too many values to unpack (expected 1)".)
+            block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
@@ -2881,22 +2902,34 @@ class Scheduler(SchedulerInterface):
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
             ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
+            for idx in range(req_num_computed_blocks):
+                invalid_here = [
+                    group_block_ids[idx]
+                    for group_block_ids in block_ids_per_group
+                    if idx < len(group_block_ids)
+                    and group_block_ids[idx] in invalid_block_ids
+                ]
+                if not invalid_here:
                     continue
 
                 is_affected = True
 
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    continue
+                # A position is "shared" only if every invalid block at it was
+                # already marked by a previous request (which will recompute
+                # it), so this request can still treat it as computed.
+                new_invalid = [
+                    block_id
+                    for block_id in invalid_here
+                    if block_id not in marked_invalid_block_ids
+                ]
+                marked_invalid_block_ids.update(invalid_here)
 
-                marked_invalid_block_ids.add(block_id)
+                if not new_invalid:
+                    # All invalid blocks here are shared with a previous request
+                    # and already marked for recomputation.
+                    # Currently this only applies to sync loading; Async
+                    # loading does not yet support block sharing.
+                    continue
 
                 if marked_invalid_block:
                     # This request has already marked an invalid block for
@@ -2911,9 +2944,11 @@ class Scheduler(SchedulerInterface):
                 )
                 total_affected_tokens += num_affected_tokens
 
-                # collect invalid block and all downstream dependent blocks
+                # collect invalid block and all downstream dependent blocks,
+                # across every group
                 if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    for group_block_ids in block_ids_per_group:
+                        blocks_to_evict.update(group_block_ids[idx:])
 
             if is_affected:
                 if not marked_invalid_block:

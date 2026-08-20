@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -299,6 +300,28 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def get_replay_boundary(self, request: Request) -> int:
+        """Return the position a later request replaying this prompt resumes at.
+
+        A cache hit is the shortest hit across all groups, so this is a
+        model-level position: every group has to retain state here, whether or
+        not it is the group that drops. Groups differ only in how much they
+        keep around it -- EAGLE groups also keep the block above, which they
+        match and drop back from (see ``reachable_block_mask``).
+
+        Under EAGLE that block must exist, so the boundary sits one alignment
+        unit below the prompt's last aligned position; every group's block size
+        divides the alignment, so the block above always fits in the prompt.
+        """
+        if not self.eagle_group_ids:
+            return request.num_prompt_tokens - 1
+        aligned = (
+            request.num_prompt_tokens
+            // self.scheduler_block_size
+            * self.scheduler_block_size
+        )
+        return max(aligned - self.scheduler_block_size, 0)
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
         Cache the blocks for the request.
@@ -309,6 +332,7 @@ class KVCacheCoordinator(ABC):
                 that need to be cached
                 (including tokens that are already cached).
         """
+        replay_boundary = self.get_replay_boundary(request)
         for manager in self.single_type_managers:
             # Only cache tokens with finalized KV. The last num_reprefillable_tokens
             # tokens can be re-prefilled during multi-module MTP.
@@ -319,6 +343,7 @@ class KVCacheCoordinator(ABC):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                replay_boundary=replay_boundary,
             )
 
     def free(self, request_id: str) -> None:
@@ -619,14 +644,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     f"{type(g.kv_cache_spec).__name__}."
                 )
         # Fine-grained hash hits require Mamba "align", no context
-        # parallelism, and compatible cache managers in every group.
+        # parallelism, and compatible cache managers in every group. TP needs
+        # hashing finer than the Mamba block; DCP accepts equality because it
+        # scales the effective full-attention block instead.
         has_partial_mamba_group = any(
             isinstance(g.kv_cache_spec, MambaSpec)
             and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
+            and (
+                (dcp_world_size == 1 and g.kv_cache_spec.block_size > hash_block_size)
+                or (
+                    dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size
+                )
+            )
             for g in kv_cache_config.kv_cache_groups
         )
-        self.enable_partial_hash_hits = dcp_world_size == 1 and has_partial_mamba_group
+        self.enable_partial_hash_hits = has_partial_mamba_group
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__
@@ -642,6 +674,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     ", ".join(sorted(unsupported_partial_hit_managers)),
                 )
         self.verify_and_split_kv_cache_groups()
+
+        # A speculative attention group drops one fine-grained hash unit from
+        # its hit. Mamba has no draft layer, but its recurrent checkpoint must
+        # be cached at the same replay boundary.
+        if self.eagle_group_ids and self.enable_partial_hash_hits:
+            for manager in self.single_type_managers:
+                if isinstance(manager, MambaManager):
+                    manager.use_eagle = True
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
@@ -718,6 +758,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
+        replay_boundary = self.get_replay_boundary(request)
         for manager in self.single_type_managers:
             num_tokens_to_cache = cached_num_computed_tokens
             # EAGLE groups match one block past each aligned boundary and drop
@@ -744,6 +785,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                replay_boundary=replay_boundary,
             )
 
     def find_longest_cache_hit(

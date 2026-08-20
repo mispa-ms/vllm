@@ -61,6 +61,7 @@ from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    effective_kv_block_size,
     maybe_convert_block_hash,
     resolve_kv_cache_block_sizes,
 )
@@ -696,6 +697,41 @@ class KVCacheStoreSendingThread(KVTransferThread):
                             key.rsplit("@", 1)[-1],
                         )
                     )
+
+            # Fine-grained EAGLE lookup proves a replay boundary by matching
+            # one additional hash unit and dropping it. The proof entry is
+            # never loaded, but it must exist so external lookup enforces the
+            # same condition as the local prefix cache.
+            proof_unit = getattr(self.coord, "eagle_proof_units", {}).get(g_idx)
+            proof_end = boundary + proof_unit if proof_unit is not None else 0
+            if (
+                proof_unit is not None
+                and proof_end // hash_block_size <= len(req_meta.block_hashes)
+                and (req_meta.num_computed_tokens or 0) >= proof_end
+            ):
+                proof_block_idx = cdiv(proof_end, db.block_size) - 1
+                if (
+                    proof_block_idx % put_step == put_step_rank
+                    and proof_block_idx < len(group_blocks)
+                ):
+                    proof_block_id = group_blocks[proof_block_idx]
+                    if proof_block_id != NULL_BLOCK_ID:
+                        proof_hash = req_meta.block_hashes[
+                            proof_end // hash_block_size - 1
+                        ]
+                        proof_key = db.key_for(proof_hash)
+                        if proof_key not in keys:
+                            addr, size = db.prepare_value_for_block(proof_block_id)
+                            keys.append(proof_key)
+                            addrs.append(addr)
+                            sizes.append(size)
+                            if group_ids is not None:
+                                group_ids.append(
+                                    _make_mooncake_group_id(
+                                        db.metadata,
+                                        proof_key.rsplit("@", 1)[-1],
+                                    )
+                                )
 
         if not keys:
             return True
@@ -1407,20 +1443,29 @@ class MooncakeStoreWorker:
             )
             return
 
-        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
-        # self.block_size (= scheduler_block_size) so the coordinator's
-        # ``block_size % hash_block_size == 0`` invariant holds.
-        groups = list(kv_cache_config.kv_cache_groups)
-        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
-            g = groups[0]
-            groups = [
-                dataclasses.replace(
+        # Under PCP/DCP the spec block_size is the *per-rank* size, while the
+        # coordinator reasons in tokens spanned across the CP ranks. Rescale
+        # each group to its effective span so the coordinator's invariants
+        # (``block_size % hash_block_size == 0`` and ``scheduler_block_size %
+        # block_size == 0``) hold. Attention groups are sharded over the CP
+        # ranks and scale; Mamba state is replicated and does not -- the same
+        # asymmetry ``resolve_kv_cache_block_sizes`` applies when it derives
+        # ``scheduler_block_size``. At cp == 1 this is a no-op, and for a
+        # single group it reproduces the previous behaviour of scaling the
+        # lone group up to ``scheduler_block_size``.
+        cp_world_size = (
+            vllm_config.parallel_config.decode_context_parallel_size
+            * vllm_config.parallel_config.prefill_context_parallel_size
+        )
+        groups = []
+        for g in kv_cache_config.kv_cache_groups:
+            eff = effective_kv_block_size(g.kv_cache_spec, cp_world_size)
+            if eff != g.kv_cache_spec.block_size:
+                g = dataclasses.replace(
                     g,
-                    kv_cache_spec=dataclasses.replace(
-                        g.kv_cache_spec, block_size=self.block_size
-                    ),
+                    kv_cache_spec=dataclasses.replace(g.kv_cache_spec, block_size=eff),
                 )
-            ]
+            groups.append(g)
         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
