@@ -937,9 +937,15 @@ class NixlBaseConnectorWorker:
         best_rtt = float("inf")
         best_offset: float | None = None
 
+        # Only the remote stages whose layer window overlaps ours are worth a
+        # handshake: a stage holding none of our layers has no descriptors we
+        # could address, and planning a member transfer against it raises rather
+        # than yielding an empty plan. Same rule the transfer and the notif
+        # count use, so a stage we skip here is one we never write to or wait on.
+        remote_pp_ranks = self._overlapping_remote_pp_ranks(remote_pp_size)
         with zmq_ctx(zmq.REQ, path) as sock:
             for remote_pp_rank, remote_rank in itertools.product(
-                range(remote_pp_size), p_remote_ranks
+                remote_pp_ranks, p_remote_ranks
             ):
                 logger.debug(
                     "Querying metadata on path: %s at remote pp rank %s, tp rank %s",

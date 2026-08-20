@@ -602,7 +602,7 @@ class TestNixlHandshake:
         worker = connector.connector_worker
         # simulate handshake
         worker.dst_xfer_side_handles = {
-            FakeNixlConnectorWorker.REMOTE_ENGINE_ID: {0: 1}
+            FakeNixlConnectorWorker.REMOTE_ENGINE_ID: {(0, 0): 1}
         }
         worker.kv_cache_layout = "HND"
         num_xfers = 4
@@ -774,9 +774,9 @@ class TestNixlHandshake:
             assert split_key in worker.src_xfer_handles_by_tp_ratio
             assert len(worker.src_xfer_handles_by_tp_ratio[split_key]) == tp_ratio
             assert remote_engine_id in worker.dst_xfer_side_handles
-            assert set(worker.dst_xfer_side_handles[remote_engine_id].keys()) == set(
-                range(tp_ratio)
-            )
+            assert set(worker.dst_xfer_side_handles[remote_engine_id].keys()) == {
+                (0, r) for r in range(tp_ratio)
+            }
 
         remote_agents, _ = worker._nixl_handshake(
             host="localhost",
@@ -2145,7 +2145,7 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
         worker.src_xfer_handles_by_block_size = {worker.block_size: 455}
         # P TP = 2 * D TP case, we should register 2 local handles
         worker.src_xfer_handles_by_tp_ratio = {(-2, 16): [456, 457]}
-        worker.dst_xfer_side_handles = {"engine1": {0: 789}}
+        worker.dst_xfer_side_handles = {"engine1": {(0, 0): 789}}
         worker._remote_agents = {"engine1": {(0, 0): "agent1"}}
         # _cleanup_remote_engine (called by shutdown) also clears these:
         worker.kv_caches_base_addr["engine1"] = {0: [0xABC]}
@@ -2200,7 +2200,7 @@ def _setup_worker_with_remote_engine(
 
     engine_id = "remote-engine-1"
     worker._remote_agents[engine_id] = {(0, 0): "agent_0", (0, 1): "agent_1"}
-    worker.dst_xfer_side_handles[engine_id] = {0: 100, 1: 200}
+    worker.dst_xfer_side_handles[engine_id] = {(0, 0): 100, (0, 1): 200}
     worker.kv_caches_base_addr[engine_id] = {0: [0xABC]}
     worker.dst_num_blocks[engine_id] = 50
     worker.tp_mappings[engine_id] = MagicMock()
@@ -3104,6 +3104,93 @@ def test_compatibility_hash_validation(
             assert len(result) == 1
 
 
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_handshake_skips_non_overlapping_remote_pp_stages(
+    default_vllm_config, dist_init
+):
+    """A PP-sharded worker handshakes only the remote stages it shares layers with.
+
+    A remote stage holding none of our layers exposes no descriptor we could
+    address, and planning a member transfer against it raises rather than
+    returning an empty plan -- so querying it at all is a startup crash. This
+    drives the real loop rather than the arithmetic helper, because the helper
+    being right does not prove the loop calls it.
+    """
+    local_vllm_config = create_vllm_config(model="facebook/opt-125m", block_size=16)
+    kv_cache_config = make_kv_cache_config(block_size=16, num_blocks=2)
+    worker = NixlConnector(
+        local_vllm_config, KVConnectorRole.WORKER, kv_cache_config
+    ).connector_worker
+
+    # transfer_topo and compat_hash are set here, and the handshake asserts on
+    # the former.
+    spec = cast(AttentionSpec, kv_cache_config.kv_cache_groups[0].kv_cache_spec)
+    shape = worker.attn_backends[0].get_kv_cache_shape(
+        num_blocks=kv_cache_config.num_blocks,
+        block_size=spec.block_size,
+        num_kv_heads=spec.num_kv_heads,
+        head_size=spec.head_size,
+    )
+    worker.register_kv_caches(
+        {
+            name: torch.zeros(*shape, dtype=spec.dtype)
+            for group in kv_cache_config.kv_cache_groups
+            for name in group.layer_names
+        }
+    )
+
+    # opt-125m is 12 layers: as stage 1 of 2 we hold [6, 12), which overlaps
+    # only stage 1 of a remote that split the same model the same way.
+    worker.pp_size = 2
+    worker.pp_rank = 1
+
+    remote_metadata = NixlAgentMetadata(
+        engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+        agent_metadata=FakeNixlWrapper.AGENT_METADATA,
+        kv_caches_base_addr=[0],
+        device_id=0,
+        num_blocks=1,
+        block_lens=[4096 * 16],
+        kv_cache_layout="HND",
+        block_size=16,
+        ssm_sizes=(0, 0),
+        attn_backend_name=worker.backend_name,
+        physical_blocks_per_logical_kv_block=1,
+    )
+    payload = NixlHandshakePayload(
+        compatibility_hash=worker.compat_hash,
+        agent_metadata_bytes=msgspec.msgpack.encode(remote_metadata),
+    )
+    mock_socket = MagicMock()
+    mock_socket.recv_multipart.return_value = [
+        msgspec.msgpack.encode(payload),
+        msgspec.msgpack.encode(time.perf_counter()),
+    ]
+
+    with (
+        patch.object(worker, "add_remote_agent", return_value="fake") as add_agent,
+        patch.object(nixl.base_worker, "zmq_ctx") as mock_zmq_ctx,
+    ):
+        mock_zmq_ctx.return_value.__enter__.return_value = mock_socket
+        result, _ = worker._nixl_handshake(
+            host="localhost",
+            port=1234,
+            remote_tp_size=1,
+            expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+            remote_pp_size=2,
+        )
+
+    queried = [
+        msgspec.msgpack.decode(c.args[0])[1] for c in mock_socket.send.mock_calls
+    ]
+    assert queried == [1], f"stage 0 holds none of our layers: {queried}"
+    assert [c.args[3] for c in add_agent.mock_calls] == [1]
+    assert set(result) == {(1, 0)}
+
+
 @pytest.mark.parametrize(
     "error_scenario",
     [
@@ -3249,7 +3336,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
             (0, rank): f"agent_p{rank}" for rank in range(prefill_tp_size)
         }
         worker.dst_xfer_side_handles = {
-            remote_engine_id: {rank: 100 + rank for rank in range(prefill_tp_size)}
+            remote_engine_id: {(0, rank): 100 + rank for rank in range(prefill_tp_size)}
         }
         # Sanity: D TP=1, P TP=4 => tp_ratio = -4 (P > D).
         assert worker.transfer_topo.tp_ratio(prefill_tp_size) == -prefill_tp_size
