@@ -32,6 +32,8 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     kv_postprocess_layout_on_receive,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
+from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.utils import get_pp_indices
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.member_transfer import (
     MemberTransferPlan,
@@ -92,6 +94,11 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+
+def _ranges_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    """Half-open [start, end) intervals share at least one layer."""
+    return a[0] < b[1] and b[0] < a[1]
 
 
 @dataclass
@@ -351,6 +358,49 @@ class NixlBaseConnectorWorker:
         """NIXL regions an SSM layer occupies: conv sub-projections + temporal."""
         assert self._conv_decomp is not None
         return len(self._conv_decomp.local_conv_offsets) + 1
+
+    @cached_property
+    def pp_rank(self) -> int:
+        """This worker's pipeline stage.
+
+        Resolved lazily: ``get_pp_group()`` asserts the group is initialized,
+        which is not true at worker ``__init__`` on every path, so reading it
+        there turns an unrelated config into a crash. Falls back to the rank
+        layout -- TP is innermost, so stage = rank // tp_size.
+        """
+        if self.pp_size == 1:
+            return 0
+        try:
+            return get_pp_group().rank_in_group
+        except AssertionError:
+            parallel = self.vllm_config.parallel_config
+            return parallel.rank // max(1, parallel.tensor_parallel_size)
+
+    def _overlapping_remote_pp_stages(self, remote_pp_size: int) -> int:
+        """How many remote PP stages hold layers this worker also holds.
+
+        A PP-sharded consumer is written to only by the producer stages whose
+        layer window overlaps its own, so the completion count cannot simply be
+        the producer's stage count. Both sides partition the same model with
+        ``get_pp_indices``, which is a pure function of (layers, rank, size), so
+        the overlap is arithmetic -- no extra handshake state is needed and the
+        remote need not describe its split.
+
+        Returns ``remote_pp_size`` unchanged when this worker is not PP-sharded,
+        which is the pre-existing behaviour for a TP-only consumer.
+        """
+        if self.pp_size == 1:
+            return remote_pp_size
+        num_layers = self.model_config.get_total_num_hidden_layers()
+        local_start, local_end = get_pp_indices(num_layers, self.pp_rank, self.pp_size)
+        return sum(
+            1
+            for stage in range(remote_pp_size)
+            if _ranges_overlap(
+                get_pp_indices(num_layers, stage, remote_pp_size),
+                (local_start, local_end),
+            )
+        )
 
     def _tracks_region_members(self) -> bool:
         """Whether register_kv_caches advertises per-region layer members.
@@ -679,12 +729,12 @@ class NixlBaseConnectorWorker:
                 "pipeline_parallel_size > 1 with Mamba/SSM hybrid KV cache "
                 "layouts requires the member-identity path (NixlPushConnector)."
             )
-        # Decode-side PP is unsupported (completions counted per consumer rank).
-        if vllm_config.kv_transfer_config.kv_role == "kv_consumer" and self.pp_size > 1:
-            raise NotImplementedError(
-                "NixlPushConnector consumer (decode) does not support "
-                "pipeline_parallel_size > 1."
-            )
+        # Decode-side PP used to be refused here, on the grounds that
+        # completions were counted per consumer rank. They are now counted by
+        # overlapping producer stage (see _overlapping_remote_pp_stages and its
+        # use in push_worker), so the refusal is gone. The guard could never
+        # have covered a kv_both decode instance anyway -- both roles carry the
+        # same role string and only dynamo knows which side it is driving.
         # Keep heartbeat handshakes to a PP-sharded producer notif-only.
         self._hb_handshake_notif_only = False
 

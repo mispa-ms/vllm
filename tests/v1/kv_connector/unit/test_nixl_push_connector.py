@@ -1030,23 +1030,33 @@ class TestPushPipelineParallel:
         assert request_id in w._recving_transfers
         assert request_id not in w.consumer_notification_counts_by_req
 
-    def test_pp_sharded_consumer_is_refused_even_under_kv_both(self):
-        """The notif count models the producer's pp_size, never our own.
+    def test_pp_sharded_consumer_settles_on_its_own_overlap(self):
+        """A PP-sharded consumer counts the producer stages that write to it.
 
-        The __init__ guard for decode-side PP tests `kv_role == "kv_consumer"`,
-        which `kv_both` does not match although it means both roles, so a
-        kv_both decode instance reaches this path unguarded and would settle
-        requests on the wrong notif count.
+        This used to raise: the count modelled the producer's pp_size with no
+        term for the consumer's own, so a kv_both decode instance -- which the
+        __init__ guard could not catch, both roles carrying the same role
+        string -- would have settled requests on the wrong number. With a PP=1
+        producer there is exactly one stage to hear from, so one notif settles
+        the request rather than raising.
         """
         w = _StubWriterWorker.fresh()
         w.transfer_topo = MagicMock()
         w.pp_size = 2
+        w.pp_rank = 0
+        w.world_size = 1
+        w.model_config = MagicMock()
+        w.model_config.get_total_num_hidden_layers.return_value = 93
         request_id = "req-pp-consumer"
         w._recving_metadata[request_id] = MagicMock(pp_size=1)
         w._pending_completion_notifs.put(f"{request_id}:1".encode())
 
-        with pytest.raises(AssertionError, match="pipeline_parallel_size > 1"):
-            w._get_new_notifs()
+        w._get_new_notifs()
+
+        # One producer stage, one TP rank mapped here: settled on the first
+        # notif, so the request is now tracked as a completed receive.
+        assert request_id in w._recving_transfers
+        assert request_id not in w.consumer_notification_counts_by_req
 
     def test_req_meta_reads_pp_size_from_kv_transfer_params(self):
         """D learns the producer's pp_size from kv_transfer_params (forwarded
@@ -1547,3 +1557,85 @@ class TestMemberGatesAgree:
         w._packed_layer_info = {}
         assert not w._requires_member_identity()
         assert not w._tracks_region_members()
+
+
+class TestDecodePipelineParallel:
+    """Completion counting for a PP-sharded consumer.
+
+    A push consumer settles a request when it has seen one notif per producer
+    rank that wrote to it. That used to be `meta.pp_size * producers_per_consumer`
+    -- the producer's stage count with no term for the consumer's own -- and a
+    PP-sharded consumer would wait forever for notifs from producer stages whose
+    layers it does not hold. Refused outright at __init__ for that reason.
+
+    The stage term is the number of producer stages whose layer window overlaps
+    this worker's. Both sides partition the same model with get_pp_indices, so
+    it is arithmetic rather than handshake state.
+    """
+
+    @staticmethod
+    def _worker(pp_size: int, pp_rank: int, num_layers: int = 93):
+        w = _StubWriterWorker.fresh()
+        w.pp_size = pp_size
+        w.pp_rank = pp_rank
+        w.model_config = MagicMock()
+        w.model_config.get_total_num_hidden_layers.return_value = num_layers
+        return w
+
+    @pytest.mark.parametrize("remote_pp", [1, 2, 4])
+    def test_tp_only_consumer_keeps_the_producer_stage_count(self, remote_pp):
+        """PP=1 consumers must be unaffected: every producer stage writes here."""
+        w = self._worker(pp_size=1, pp_rank=0)
+        assert w._overlapping_remote_pp_stages(remote_pp) == remote_pp
+
+    def test_equal_splits_expect_one_stage_each(self):
+        """The case the old count hung on: P and D both PP=2."""
+        for rank in (0, 1):
+            w = self._worker(pp_size=2, pp_rank=rank)
+            assert w._overlapping_remote_pp_stages(2) == 1
+
+    @pytest.mark.parametrize("local_pp,remote_pp", [(2, 4), (4, 2), (2, 3), (3, 2)])
+    def test_every_consumer_stage_expects_at_least_one_producer(
+        self, local_pp, remote_pp
+    ):
+        """A consumer that expects zero notifs would settle a request whose KV
+        never arrived; one that expects more than the producer has would hang.
+
+        Layer counts are not generally divisible by the stage count -- 93 is
+        not -- so the exact number per stage is a property of get_pp_indices,
+        not a constant worth pinning. These are the bounds that matter.
+        """
+        for rank in range(local_pp):
+            w = self._worker(pp_size=local_pp, pp_rank=rank)
+            n = w._overlapping_remote_pp_stages(remote_pp)
+            assert 1 <= n <= remote_pp
+
+    @pytest.mark.parametrize("num_layers", [93, 61, 32])
+    @pytest.mark.parametrize("local_pp,remote_pp", [(2, 2), (2, 3), (3, 2), (4, 4)])
+    def test_every_producer_stage_is_claimed_exactly_once(
+        self, num_layers, local_pp, remote_pp
+    ):
+        """No layer is dropped and none is transferred twice.
+
+        Summed over consumer stages, each producer stage must be counted once
+        per consumer it overlaps -- and every producer stage must be counted at
+        least once, or its layers would never arrive.
+        """
+        from vllm.distributed.utils import get_pp_indices
+
+        claims = [0] * remote_pp
+        for rank in range(local_pp):
+            w = self._worker(pp_size=local_pp, pp_rank=rank, num_layers=num_layers)
+            me = get_pp_indices(num_layers, rank, local_pp)
+            for stage in range(remote_pp):
+                lo, hi = get_pp_indices(num_layers, stage, remote_pp)
+                if lo < me[1] and me[0] < hi:
+                    claims[stage] += 1
+            # the worker's own count must agree with the overlap it just found
+            assert w._overlapping_remote_pp_stages(remote_pp) == sum(
+                1
+                for stage in range(remote_pp)
+                if get_pp_indices(num_layers, stage, remote_pp)[0] < me[1]
+                and me[0] < get_pp_indices(num_layers, stage, remote_pp)[1]
+            )
+        assert all(c >= 1 for c in claims), f"unclaimed producer stage: {claims}"

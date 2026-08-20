@@ -737,23 +737,22 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             # Not tracked as a P-side send/process for this notif.
             if req_id not in self._reqs_to_send and req_id not in self._reqs_to_process:
                 if (meta := self._recving_metadata.get(req_id)) is not None:
-                    # We are acting as the consumer. The __init__ guard for
-                    # decode-side PP keys off kv_role == "kv_consumer", which
-                    # kv_both does not match even though it means both roles,
-                    # so it cannot fire for a kv_both decode instance. Check
-                    # here instead, where the role is not in question: the
-                    # count below models the *producer's* pp_size and has no
-                    # term for our own, so a PP-sharded consumer would settle
-                    # requests on the wrong notif count.
-                    assert self.pp_size == 1, (
-                        "NixlPushConnector consumer (decode) does not support "
-                        f"pipeline_parallel_size > 1 (got {self.pp_size})."
-                    )
-                    # Consumer waits for one notif per producer rank writing
-                    # here: pp_size stages * producers-per-consumer (>1 when
-                    # producer TP > consumer TP; tp_size is the producer TP).
+                    # We are acting as the consumer. One notif per producer
+                    # rank that writes here: the producer stages holding layers
+                    # we also hold, times the producer TP ranks mapped to us
+                    # (>1 when producer TP > consumer TP; tp_size is producer
+                    # TP, world_size is ours and is TP-only).
+                    #
+                    # The stage term is not simply meta.pp_size. A PP-sharded
+                    # consumer is written to only by the producer stages whose
+                    # layer window overlaps its own -- with equal splits on both
+                    # sides that is exactly one, and expecting meta.pp_size
+                    # would wait forever for notifs no one sends.
                     producers_per_consumer = max(1, int(tp_size) // self.world_size)
-                    expected_notifs = meta.pp_size * producers_per_consumer
+                    expected_notifs = (
+                        self._overlapping_remote_pp_stages(meta.pp_size)
+                        * producers_per_consumer
+                    )
                     self.consumer_notification_counts_by_req[req_id] += 1
                     notifs = self.consumer_notification_counts_by_req[req_id]
                     if notifs < expected_notifs:
