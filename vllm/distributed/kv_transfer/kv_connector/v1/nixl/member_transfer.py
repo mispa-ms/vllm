@@ -12,6 +12,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 MemberLayout = tuple[int, int]
 
 
+class KVLayoutMismatchError(RuntimeError):
+    """The two engines hold different sets of KV layers.
+
+    Static: the layer sets are fixed at startup, so every subsequent request
+    fails identically. Callers should say so once and stop, rather than
+    retrying per request -- which turns a config error into an hour of silence.
+    """
+
+
 @dataclass(frozen=True)
 class MemberTransferPlan:
     """Local descriptor layout for a member-ordered transfer."""
@@ -83,9 +92,12 @@ def plan_member_transfer(
         for layer_name in local_members:
             remote_region = remote_region_of.get(layer_name)
             if remote_region is None:
-                raise RuntimeError(
+                raise KVLayoutMismatchError(
                     "Remote NIXL metadata is missing locally owned KV cache "
-                    f"layer {layer_name!r}; the transfer would leave it stale"
+                    f"layer {layer_name!r}; the transfer would leave it stale. "
+                    "The two engines were built with different KV layer sets -- "
+                    "most often a speculative-config set on one side only, whose "
+                    "draft model registers KV this peer never advertises."
                 )
             group_id = layer_to_group.get(layer_name)
             if group_id is None:

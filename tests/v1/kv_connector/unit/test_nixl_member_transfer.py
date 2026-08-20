@@ -6,6 +6,7 @@ import msgspec
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.member_transfer import (
+    KVLayoutMismatchError,
     plan_member_transfer,
     validate_region_members,
 )
@@ -239,6 +240,18 @@ class TestNonOverlappingStagesAreNotPlannable:
         stage = self._stage(0, 2)
         _meta, plan = self._plan(stage, stage)
         assert plan.member_names == tuple(stage)
+
+    def test_the_raise_is_typed_so_callers_can_stop_retrying(self):
+        """A layer set mismatch is static; the type says so.
+
+        This is what a speculative-config on one side only looks like: the draft
+        registers KV the peer never advertises. Retrying it per request cost an
+        hour of an idle-reaper timeout with nothing in the CI log (63751281).
+        """
+        with pytest.raises(KVLayoutMismatchError) as exc:
+            self._plan(self._stage(0, 2), self._stage(1, 2))
+        assert "speculative-config" in str(exc.value)
+        assert isinstance(exc.value, RuntimeError)
 
     def test_disjoint_stage_raises(self):
         with pytest.raises(RuntimeError, match="missing locally owned KV cache"):

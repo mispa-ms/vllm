@@ -44,6 +44,9 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.member_transfer import (
+    KVLayoutMismatchError,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlConnectorMetadata,
@@ -92,6 +95,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # Heartbeat handshakes to a PP-sharded producer must be notif-only,
         # like the PUSH_REG path.
         self._hb_handshake_notif_only = True
+        self._layout_mismatch_reported = False
 
         # Push-specific state.
         # P-side: outgoing WRITE handles awaiting completion, keyed by
@@ -449,6 +453,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     self._log_failure(
                         failure_type="push_handshake_failed", req_id=rid, error=e
                     )
+                    self._report_layout_mismatch(e)
                     return
                 self._deferred_push_inbox.put((rid, blocks, rd))
                 self._push_writer_wake.set()
@@ -500,6 +505,28 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         if block_ids and not isinstance(block_ids[0], (list, tuple)):
             return (list(block_ids),)
         return block_ids
+
+    def _report_layout_mismatch(self, error: BaseException) -> None:
+        """Say once, loudly, that the peers' KV layer sets do not match.
+
+        A layout mismatch is fixed at startup, so the per-request warning the
+        generic failure path emits repeats for every request while the run
+        makes no progress -- 512 times, in the arm that prompted this, before an
+        idle reaper killed the job an hour later with nothing in the CI log to
+        say why. This does not abort the engine; it makes the cause findable in
+        the first screen of the worker log.
+        """
+        cause: BaseException | None = error
+        while cause is not None and not isinstance(cause, KVLayoutMismatchError):
+            cause = cause.__cause__ or cause.__context__
+        if cause is None or self._layout_mismatch_reported:
+            return
+        self._layout_mismatch_reported = True
+        logger.error(
+            "NIXL KV layout mismatch with the peer; every transfer will fail "
+            "the same way and the engine will not recover: %s",
+            cause,
+        )
 
     def _xfer_blocks_for_req(self, req_id: str, meta: ReqMeta):
         """Issue WRITE transfers to one or more remote TP ranks."""
