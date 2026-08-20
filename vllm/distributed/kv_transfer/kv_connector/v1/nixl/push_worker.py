@@ -344,6 +344,27 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:
         engine_id = reg_data["remote_engine_id"]
+        # Only D sends PUSH_REG, so the role is not in question here -- kv_both
+        # carries the same role string on both sides, which is why the worker
+        # __init__ cannot make this call.
+        #
+        # Counting completions by overlapping producer stage is in place, but
+        # the transfer path still reaches only D's stage 0: reg_data carries
+        # decode_tp_size and no decode_pp_size, the reverse handshake passes no
+        # pp_size so it loops over range(1), add_remote_agent keys agents at
+        # (0, remote_tp_rank), and dst_xfer_side_handles is keyed by TP rank
+        # alone. With D_PP > 1, stage 1 is never written to and would wait on a
+        # notif no one sends -- a hang, which is worse than this.
+        if self.pp_size > 1:
+            raise NotImplementedError(
+                "NixlPushConnector decode-side pipeline_parallel_size > 1 is "
+                f"not supported yet (got {self.pp_size}): the KV transfer path "
+                "reaches only decode stage 0. Needs decode_pp_size advertised "
+                "in PUSH_REG, a reverse handshake over every decode stage, "
+                "transfer handles keyed by (pp_rank, tp_rank), and member-plan "
+                "filtering for non-overlapping stages."
+            )
+
         notif_msg = PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg_data)
         agents = self._remote_agents.get(engine_id)
         if not agents:
