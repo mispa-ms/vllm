@@ -1718,7 +1718,7 @@ def test_push_write_hybrid_mla_replicates_attention():
             rank_offset_factor=0,
         )
     }
-    worker.dst_xfer_side_handles = {engine_id: {0: 100, 1: 101}}
+    worker.dst_xfer_side_handles = {engine_id: {(0, 0): 100, (0, 1): 101}}
     worker.src_xfer_handles_by_tp_ratio = {(-2, 4): [200, 201]}
     worker.src_xfer_handles_by_block_size = {4: 300}
     worker._sending_transfers = defaultdict(list)
@@ -1731,6 +1731,12 @@ def test_push_write_hybrid_mla_replicates_attention():
     meta.remote.engine_id = engine_id
     meta.remote.block_ids = [[7, 8], [3]]
     meta.local_physical_block_ids = [[1, 2], [5]]
+    # A real int: the write path reads D's stage count off the request to pick
+    # which decode stages to write to, and a MagicMock does not compare. The
+    # worker is built with object.__new__, so its own stage count is set here
+    # too rather than by __init__.
+    meta.decode_pp_size = 1
+    worker.pp_size = 1
 
     worker._xfer_blocks_for_req("req-1", meta)
 

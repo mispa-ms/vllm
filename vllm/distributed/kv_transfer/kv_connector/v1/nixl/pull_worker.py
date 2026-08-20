@@ -199,9 +199,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     remote_block_size
                 ]
 
-            # Destination handle: remote_engine_id -> remote_rank -> handle.
+            # Destination handle: engine -> (remote_pp_rank, remote_rank) -> handle.
+            # Pull does not handshake a PP-sharded producer -- it advertises no
+            # pp_size and _background_nixl_handshake passes none -- so every
+            # agent it knows sits at stage 0.
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
-                spec.remote_rank
+                (0, spec.remote_rank)
             ]
 
             self._read_blocks(

@@ -389,18 +389,28 @@ class NixlBaseConnectorWorker:
         Returns ``remote_pp_size`` unchanged when this worker is not PP-sharded,
         which is the pre-existing behaviour for a TP-only consumer.
         """
+        return len(self._overlapping_remote_pp_ranks(remote_pp_size))
+
+    def _overlapping_remote_pp_ranks(self, remote_pp_size: int) -> list[int]:
+        """Which remote PP stages hold layers this worker also holds.
+
+        The consumer side counts these to know how many completion notifs to
+        expect; the producer side writes to exactly these and no others, since
+        a stage outside the overlap holds different layers at the same
+        descriptor offsets.
+        """
         if self.pp_size == 1:
-            return remote_pp_size
+            return list(range(remote_pp_size))
         num_layers = self.model_config.get_total_num_hidden_layers()
         local_start, local_end = get_pp_indices(num_layers, self.pp_rank, self.pp_size)
-        return sum(
-            1
+        return [
+            stage
             for stage in range(remote_pp_size)
             if _ranges_overlap(
                 get_pp_indices(num_layers, stage, remote_pp_size),
                 (local_start, local_end),
             )
-        )
+        ]
 
     def _tracks_region_members(self) -> bool:
         """Whether register_kv_caches advertises per-region layer members.
@@ -464,40 +474,46 @@ class NixlBaseConnectorWorker:
         return member_meta, member_plan
 
     def _check_member_plan_consistency(
-        self, engine_id: EngineId, member_plan: MemberTransferPlan
+        self,
+        engine_id: EngineId,
+        remote_pp_rank: int,
+        member_plan: MemberTransferPlan,
     ) -> None:
         """Reject a later remote TP rank whose member layout diverges.
 
-        Every remote TP rank of one engine shares the single cached local
+        Every remote TP rank of one *stage* shares that stage's cached local
         source handle, so its plan must match or the cached local descriptor
-        order would be paired with a different remote order. Called before any
+        order would be paired with a different remote order. Different stages
+        are expected to differ and are cached separately. Called before any
         per-rank NIXL resources are created, so a divergent rank fails without
         leaking state.
         """
-        existing = self._member_xfer_state.get(engine_id)
+        existing = self._member_xfer_state.get((engine_id, remote_pp_rank))
         if existing is not None and existing.plan != member_plan:
             raise RuntimeError(
-                f"Remote TP ranks of engine {engine_id!r} advertised inconsistent "
-                "member layouts; refusing to reuse the cached local member-ordered "
-                "transfer handle."
+                f"Remote TP ranks of engine {engine_id!r} stage {remote_pp_rank} "
+                "advertised inconsistent member layouts; refusing to reuse the "
+                "cached local member-ordered transfer handle."
             )
 
     def _register_member_state(
         self,
         engine_id: EngineId,
+        remote_pp_rank: int,
         member_plan: MemberTransferPlan,
         remote_block_size: int,
     ) -> None:
-        """Register the engine's member-ordered local source handle once.
+        """Register this remote stage's member-ordered local source handle once.
 
-        Idempotent per engine: the first remote TP rank registers the handle;
-        later ranks reuse it (consistency already checked by
-        ``_check_member_plan_consistency``).
+        Idempotent per (engine, stage): the first remote TP rank of a stage
+        registers the handle; later ranks of that stage reuse it (consistency
+        already checked by ``_check_member_plan_consistency``). Stages get their
+        own handle because each advertises its own layer window.
         """
-        if engine_id in self._member_xfer_state:
+        if (engine_id, remote_pp_rank) in self._member_xfer_state:
             return
         handle = self.register_local_xfer_handler(remote_block_size, member_plan)[0]
-        self._member_xfer_state[engine_id] = _MemberTransferState(
+        self._member_xfer_state[(engine_id, remote_pp_rank)] = _MemberTransferState(
             handle=handle,
             plan=member_plan,
         )
@@ -747,9 +763,17 @@ class NixlBaseConnectorWorker:
         # Per-source split handles, keyed by (tp_ratio, remote_block_size).
         self.src_xfer_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
         # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
-        self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
+        # Keyed by (remote_pp_rank, remote_tp_rank). A PP-sharded remote has
+        # one descriptor list per stage: stage p holds only its layer window,
+        # so a single tp-keyed handle would address the wrong memory.
+        self.dst_xfer_side_handles = defaultdict[EngineId, dict[tuple[int, int], int]](
+            dict
+        )
         # engine -> member-ordered source handle and its immutable layout plan
-        self._member_xfer_state: dict[EngineId, _MemberTransferState] = {}
+        # Keyed by (engine_id, remote_pp_rank). Stages of one engine advertise
+        # different member sets by construction, so they cannot share a plan --
+        # only the TP ranks *within* a stage must agree.
+        self._member_xfer_state: dict[tuple[EngineId, int], _MemberTransferState] = {}
 
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
@@ -1010,7 +1034,7 @@ class NixlBaseConnectorWorker:
                     )
                 else:
                     remote_agent_name = self.add_remote_agent(
-                        metadata, remote_rank, remote_tp_size
+                        metadata, remote_rank, remote_tp_size, remote_pp_rank
                     )
                 setup_agent_time = time.perf_counter()
                 logger.debug(
@@ -1951,6 +1975,7 @@ class NixlBaseConnectorWorker:
         nixl_agent_meta: NixlAgentMetadata,
         remote_tp_rank: int = 0,
         remote_tp_size: int = 1,
+        remote_pp_rank: int = 0,
     ) -> str:
         """
         Add the remote NIXL agent and prepare the descriptors for reading cache
@@ -1997,14 +2022,14 @@ class NixlBaseConnectorWorker:
         """  # noqa: E501
         engine_id = nixl_agent_meta.engine_id
         # TODO re-evaluate refreshing for scaling/recovery
-        if (0, remote_tp_rank) in self._remote_agents.get(engine_id, {}):
+        if (remote_pp_rank, remote_tp_rank) in self._remote_agents.get(engine_id, {}):
             logger.debug(
                 "Remote agent with engine_id %s and rank"
                 "%s already exchanged metadata, skip handshake.",
                 engine_id,
                 remote_tp_rank,
             )
-            return self._remote_agents[engine_id][(0, remote_tp_rank)]
+            return self._remote_agents[engine_id][(remote_pp_rank, remote_tp_rank)]
 
         member_plan: MemberTransferPlan | None = None
         if self._use_member_identity(nixl_agent_meta):
@@ -2030,7 +2055,7 @@ class NixlBaseConnectorWorker:
         # Reject a divergent later TP rank before creating any per-rank NIXL
         # resources, so the failure can't leak an unpublished remote agent.
         if member_plan is not None:
-            self._check_member_plan_consistency(engine_id, member_plan)
+            self._check_member_plan_consistency(engine_id, remote_pp_rank, member_plan)
 
         ### Register remote engine in TransferTopology (idempotent).
         assert self.transfer_topo is not None
@@ -2159,13 +2184,13 @@ class NixlBaseConnectorWorker:
 
         # Register with NIXL.
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
-        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
+        self.dst_xfer_side_handles[engine_id][(remote_pp_rank, remote_tp_rank)] = (
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
         )
 
         if member_plan is not None:
             self._register_member_state(
-                engine_id, member_plan, nixl_agent_meta.block_size
+                engine_id, remote_pp_rank, member_plan, nixl_agent_meta.block_size
             )
 
         return remote_agent_name
@@ -3076,9 +3101,11 @@ class NixlBaseConnectorWorker:
         # Notif-only engines (push-mode D side) have no descriptor state.
         for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
             self.nixl_wrapper.release_dlist_handle(handle)
-        member_state = self._member_xfer_state.pop(engine_id, None)
-        if member_state is not None:
-            self.nixl_wrapper.release_dlist_handle(member_state.handle)
+        # One handle per (engine, stage), so release every stage of this engine.
+        for key in [k for k in self._member_xfer_state if k[0] == engine_id]:
+            self.nixl_wrapper.release_dlist_handle(
+                self._member_xfer_state.pop(key).handle
+            )
         for agent_name in self._remote_agents.pop(engine_id).values():
             self.nixl_wrapper.remove_remote_agent(agent_name)
 

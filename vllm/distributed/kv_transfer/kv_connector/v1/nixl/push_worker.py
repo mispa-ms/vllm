@@ -344,27 +344,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:
         engine_id = reg_data["remote_engine_id"]
-        # Only D sends PUSH_REG, so the role is not in question here -- kv_both
-        # carries the same role string on both sides, which is why the worker
-        # __init__ cannot make this call.
-        #
-        # Counting completions by overlapping producer stage is in place, but
-        # the transfer path still reaches only D's stage 0: reg_data carries
-        # decode_tp_size and no decode_pp_size, the reverse handshake passes no
-        # pp_size so it loops over range(1), add_remote_agent keys agents at
-        # (0, remote_tp_rank), and dst_xfer_side_handles is keyed by TP rank
-        # alone. With D_PP > 1, stage 1 is never written to and would wait on a
-        # notif no one sends -- a hang, which is worse than this.
-        if self.pp_size > 1:
-            raise NotImplementedError(
-                "NixlPushConnector decode-side pipeline_parallel_size > 1 is "
-                f"not supported yet (got {self.pp_size}): the KV transfer path "
-                "reaches only decode stage 0. Needs decode_pp_size advertised "
-                "in PUSH_REG, a reverse handshake over every decode stage, "
-                "transfer handles keyed by (pp_rank, tp_rank), and member-plan "
-                "filtering for non-overlapping stages."
-            )
-
         notif_msg = PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg_data)
         agents = self._remote_agents.get(engine_id)
         if not agents:
@@ -455,6 +434,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             registration_data["decode_host"],
             registration_data["decode_port"],
             registration_data["decode_tp_size"],
+            registration_data.get("decode_pp_size", 1),
         )
         if fut is not None:
 
@@ -489,6 +469,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             local_block_ids=logical_local,
             local_physical_block_ids=physical_local,
             tp_size=self.world_size,
+            decode_pp_size=registration_data.get("decode_pp_size", 1),
             remote=RemoteMeta(
                 block_ids=logical_remote,
                 host="",
@@ -527,10 +508,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         plan = self.tp_mappings[engine_id]
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
-        member_state = self._member_xfer_state.get(engine_id)
-        member_groups = (
-            member_state.plan.group_ids if member_state is not None else None
-        )
+        # Which decode stages this producer writes to. A PP-sharded consumer
+        # splits the model too, and a producer stage only owns the layers in its
+        # own window, so it writes to the decode stages whose window overlaps --
+        # writing to the others would address memory holding different layers.
+        # Both sides partition with get_pp_indices, so this is arithmetic.
+        decode_pp_size = max(1, meta.decode_pp_size)
+        write_stages = self._overlapping_remote_pp_ranks(decode_pp_size)
 
         # Expand D's logical IDs using the ratio learned during the
         # NIXL handshake. ``meta`` is freshly built by
@@ -552,9 +536,12 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         replicate_attn = self.use_mla and tp_ratio < 0
         if replicate_attn and not self._has_mamba:
             assert len(plan.all_source_ranks) == 1
-            write_ranks = sorted(self.dst_xfer_side_handles[engine_id])
+            tp_targets = sorted(
+                {tp for (_, tp) in self.dst_xfer_side_handles[engine_id]}
+            )
         else:
-            write_ranks = list(plan.all_source_ranks)
+            tp_targets = list(plan.all_source_ranks)
+        write_ranks = [(stage, tp) for stage in write_stages for tp in tp_targets]
 
         def group_ids(block_ids: BlockIds, rank: int) -> BlockIds:
             return [
@@ -567,15 +554,20 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         read_specs = [
             ReadSpec(
-                remote_rank=rank,
-                local_block_ids=group_ids(local_block_ids, rank),
-                remote_block_ids=group_ids(remote_block_ids, rank),
+                remote_rank=tp,
+                local_block_ids=group_ids(local_block_ids, tp),
+                remote_block_ids=group_ids(remote_block_ids, tp),
             )
-            for rank in write_ranks
+            for (_stage, tp) in write_ranks
         ]
 
         handles: list[int] = []
         for i, spec in enumerate(read_specs):
+            remote_pp_rank = write_ranks[i][0]
+            member_state = self._member_xfer_state.get((engine_id, remote_pp_rank))
+            member_groups = (
+                member_state.plan.group_ids if member_state is not None else None
+            )
             remote_block_size = remote_info.remote_block_size
             logger.debug(
                 "Remote agent %s available, calling _xfer_blocks"
@@ -599,7 +591,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 ]
 
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
-                spec.remote_rank
+                (remote_pp_rank, spec.remote_rank)
             ]
 
             handle = self._xfer_blocks(

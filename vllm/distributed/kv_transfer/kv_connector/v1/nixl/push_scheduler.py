@@ -183,6 +183,11 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             "decode_host": self.side_channel_host,
             "decode_port": self.side_channel_port,
             "decode_tp_size": (self.vllm_config.parallel_config.tensor_parallel_size),
+            # P needs D's stage count to handshake every decode stage and to
+            # write only the ones holding its layers. The producer's own
+            # pp_size already travels the other way as remote_pp_size; without
+            # this the pair was asymmetric and P only ever saw decode stage 0.
+            "decode_pp_size": (self.vllm_config.parallel_config.pipeline_parallel_size),
             "local_block_ids": local_block_ids,
             "remote_engine_id": params["remote_engine_id"],
             "remote_host": params["remote_host"],

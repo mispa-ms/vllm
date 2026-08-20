@@ -1156,7 +1156,7 @@ class TestPushWriterMlaReplication:
             )
         }
         w._logical_to_kernel_block_ids = lambda block_ids, ratio: block_ids
-        w.dst_xfer_side_handles = {engine_id: {r: 1000 + r for r in d_ranks}}
+        w.dst_xfer_side_handles = {engine_id: {(0, r): 1000 + r for r in d_ranks}}
         w.src_xfer_handles_by_block_size = {16: 2000}
         w._remote_agents = {engine_id: {(0, r): f"agent-{r}" for r in d_ranks}}
         return w, engine_id
@@ -1247,7 +1247,7 @@ class TestPushPrefixCaching:
             )
         }
         w.dst_num_blocks = {engine_id: 10_000, w.engine_id: 10_000}
-        w.dst_xfer_side_handles = {engine_id: {0: 5000}}
+        w.dst_xfer_side_handles = {engine_id: {(0, 0): 5000}}
         w.src_xfer_handles_by_block_size = {16: 2000}
 
         # Stub only the NIXL WRITE; kernel expansion, prefix-cache trim, desc
@@ -1386,9 +1386,9 @@ def test_remote_cleanup_releases_member_handle():
     worker = _StubWriterWorker.fresh()
     worker.nixl_wrapper = MagicMock()
     worker._remote_agents = {"remote": {(0, 0): "agent"}}
-    worker.dst_xfer_side_handles = {"remote": {0: 11}}
+    worker.dst_xfer_side_handles = {"remote": {(0, 0): 11}}
     worker._member_xfer_state = {
-        "remote": _MemberTransferState(
+        ("remote", 0): _MemberTransferState(
             handle=22,
             plan=MemberTransferPlan(
                 member_names=("a",),
@@ -1410,7 +1410,7 @@ def test_remote_cleanup_releases_member_handle():
         call.args[0] for call in worker.nixl_wrapper.release_dlist_handle.call_args_list
     ]
     assert released == [11, 22]
-    assert "remote" not in worker._member_xfer_state
+    assert ("remote", 0) not in worker._member_xfer_state
     worker.nixl_wrapper.remove_remote_agent.assert_called_once_with("agent")
 
 
@@ -1428,15 +1428,15 @@ def test_member_state_rejects_divergent_remote_ranks():
         group_ids=(1, 0),
     )
 
-    worker._register_member_state("eng", plan_a, 16)
-    assert worker._member_xfer_state["eng"].handle == 99
+    worker._register_member_state("eng", 0, plan_a, 16)
+    assert worker._member_xfer_state[("eng", 0)].handle == 99
     # A matching later rank passes the consistency check and reuses the handle.
-    worker._check_member_plan_consistency("eng", plan_a)
-    worker._register_member_state("eng", plan_a, 16)
+    worker._check_member_plan_consistency("eng", 0, plan_a)
+    worker._register_member_state("eng", 0, plan_a, 16)
     worker.register_local_xfer_handler.assert_called_once()
     # A rank whose member order differs is rejected before any registration.
     with pytest.raises(RuntimeError, match="inconsistent member layouts"):
-        worker._check_member_plan_consistency("eng", plan_b)
+        worker._check_member_plan_consistency("eng", 0, plan_b)
 
 
 class TestMemberIdentityWithMamba:

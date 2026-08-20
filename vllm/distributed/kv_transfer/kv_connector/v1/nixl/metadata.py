@@ -237,6 +237,9 @@ class ReqMeta:
     remote_block_size: int | None = None
     # Remote producer pipeline-parallel size (push mode, D side).
     pp_size: int = 1
+    # Consumer pipeline-parallel size (push mode, P side, off PUSH_REG). P
+    # writes only to the decode stages whose layer window overlaps its own.
+    decode_pp_size: int = 1
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
