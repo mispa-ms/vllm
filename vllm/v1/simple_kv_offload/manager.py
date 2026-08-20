@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
     MambaSpec,
@@ -223,14 +224,18 @@ class SimpleCPUOffloadScheduler:
 
         Mirrors ``resolve_kv_cache_block_sizes`` and the ``dcp_world_size`` that
         ``HybridKVCacheCoordinator.find_longest_cache_hit`` passes down: DCP
-        shards the sequence for full-attention groups only, so a full-attention
-        block spans ``block_size * dcp`` tokens while a Mamba group keeps its
-        full per-rank state and spans ``block_size``. Scaling every group is a
-        no-op at dcp=1, which is why it went unnoticed; on a hybrid model at
-        dcp=4 it makes this manager take a quarter of the Mamba blocks it
-        should.
+        shards the sequence for attention groups, so an attention block spans
+        ``block_size * dcp`` tokens while a Mamba group keeps its full per-rank
+        state and spans ``block_size``. Scaling every group is a no-op at
+        dcp=1, which is why it went unnoticed; on a hybrid model at dcp=4 it
+        makes this manager take a quarter of the Mamba blocks it should.
+
+        The predicate is ``AttentionSpec``, not ``FullAttentionSpec``, because
+        that is what ``resolve_kv_cache_block_sizes`` uses. They differ for
+        sliding-window and chunked-local groups, which DCP shards just the
+        same.
         """
-        if isinstance(spec, FullAttentionSpec):
+        if isinstance(spec, AttentionSpec):
             return spec.block_size * self.cp_world_size
         return spec.block_size
 

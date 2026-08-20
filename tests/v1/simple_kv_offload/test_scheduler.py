@@ -35,10 +35,12 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     register_all_kvcache_specs,
 )
 from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    SlidingWindowSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -1831,3 +1833,32 @@ def test_cp_lazy_target_blocks_scaling(cp_world_size: int) -> None:
             f"cp_world_size={cp_world_size}: target_cp={target_cp} should be "
             f"less than target_base={target_base}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 18: _group_block_size uses the same predicate as the scheduler
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "spec_cls",
+    [FullAttentionSpec, SlidingWindowSpec, ChunkedLocalAttentionSpec],
+)
+def test_group_block_size_scales_every_attention_spec(spec_cls) -> None:
+    """DCP shards the sequence for attention groups, not just full attention.
+
+    ``resolve_kv_cache_block_sizes`` keys this off ``AttentionSpec``. This
+    manager once used ``FullAttentionSpec``, which silently under-counts a
+    sliding-window or chunked-local group at dcp>1 while its docstring claimed
+    to mirror the scheduler.
+    """
+    dcp = 2
+    sched = _make_cp_scheduler(dcp_world_size=dcp).scheduler
+
+    kwargs = dict(
+        block_size=BLOCK_SIZE, num_kv_heads=1, head_size=8, dtype=torch.float16
+    )
+    if spec_cls is SlidingWindowSpec:
+        kwargs["sliding_window"] = 128
+    elif spec_cls is ChunkedLocalAttentionSpec:
+        kwargs["attention_chunk_size"] = 128
+
+    assert sched._group_block_size(spec_cls(**kwargs)) == BLOCK_SIZE * dcp

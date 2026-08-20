@@ -106,7 +106,7 @@ def _swa(block_size=16, sliding_window=32):
 
 
 def _hashes(n: int) -> list[BlockHash]:
-    return [BlockHash(bytes([i + 1]) * 4) for i in range(n)]
+    return [BlockHash((i + 1).to_bytes(4, "little")) for i in range(n)]
 
 
 # ----- Single-group coordinator -----
