@@ -25,6 +25,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
+from types import SimpleNamespace
 from concurrent.futures import Future
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -32,6 +33,13 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    NixlBaseConnectorWorker,
+    _MemberTransferState,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.member_transfer import (
+    MemberTransferPlan,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
@@ -43,7 +51,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import make_nixl_push_scheduler
@@ -330,11 +338,16 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         # Base worker fields touched by start_load_kv / _get_new_notifs.
         w._recving_metadata = {}
         w._recving_transfers = defaultdict(list)
+        w._is_hma_required = False
+        w._packed_block_stride = 0
+        w._packed_layer_info = {}
+        w._member_xfer_state = {}
         w._reqs_to_process = set()
         w._reqs_to_send = {}
         w.consumer_notification_counts_by_req = defaultdict(int)
         w.tp_rank = 0
         w.world_size = 1
+        w.pp_size = 1
         w.engine_id = "test-decode-engine"
         w._remote_agents = {}
         w._physical_blocks_per_logical_kv_block = 1
@@ -343,6 +356,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._group_spec_types = (FullAttentionSpec,)
         w._engine_ttl = 0.0
         w._engine_last_active = {}
+        w._engine_clock_offset = {}
 
         # Track _do_start_push_kv invocations.
         calls: list[tuple[str, Any, dict[str, Any]]] = []
@@ -1248,3 +1262,221 @@ class TestPushPrefixCaching:
         local, remote = self._written_block_ids(w)
         assert local == [10, 11, 12]
         assert remote == [500, 501, 502]
+def _agent_metadata(
+    region_members: list[list[str]],
+    base_addresses: list[int],
+    block_lens: list[int],
+) -> NixlAgentMetadata:
+    return NixlAgentMetadata(
+        engine_id="remote-engine",
+        agent_metadata=b"agent",
+        kv_caches_base_addr=base_addresses,
+        device_id=7,
+        num_blocks=2,
+        block_lens=block_lens,
+        kv_cache_layout="HND",
+        block_size=16,
+        ssm_sizes=(0, 0),
+        attn_backend_name="FLASH_ATTN",
+        physical_blocks_per_logical_kv_block=1,
+        region_members=region_members,
+    )
+
+
+def _member_worker(
+    region_members: list[list[str]],
+    group_by_member: dict[str, int],
+) -> _StubWriterWorker:
+    worker = _StubWriterWorker.fresh()
+    worker.pp_size = 2
+    worker._has_mamba = False
+    worker._is_hma_required = True
+    worker._layer_name_to_kv_group_index = group_by_member
+    worker.transfer_topo = MagicMock()
+    worker._set_region_members(region_members)
+    return worker
+
+
+def test_member_plan_routes_descriptor_blocks():
+    worker = _StubWriterWorker.fresh()
+    worker._has_mamba = False
+    worker.num_regions = 3
+    desc_ids = worker._compute_desc_ids(
+        block_ids=[[1, 2], [5]],
+        dst_num_blocks=10,
+        block_size_ratio=None,
+        physical_blocks_per_logical=1,
+        region_group_ids=(0, 1, 0),
+    )
+    assert desc_ids.tolist() == [1, 2, 15, 21, 22]
+
+
+def test_member_identity_gate_preserves_the_non_hma_path():
+    metadata = _agent_metadata([["a"]], [0xA000], [128])
+    worker = _member_worker([["a"]], {"a": 0})
+
+    assert worker._use_member_identity(metadata)
+    # A bare base worker (pull) never requires member routing.
+    assert not object.__new__(NixlBaseConnectorWorker)._use_member_identity(metadata)
+
+    # Local layout requires routing but the remote omitted member metadata:
+    # fail loud instead of silently falling back to region-index routing.
+    metadata.region_members = []
+    with pytest.raises(RuntimeError, match="requires member-identity routing"):
+        worker._use_member_identity(metadata)
+
+    # A non-HMA local layout does not require member routing.
+    worker._is_hma_required = False
+    metadata.region_members = [["a"]]
+    assert not worker._use_member_identity(metadata)
+
+    # A PP-sharded packed layout requires the same member route independently
+    # of whether HMA is required.
+    worker._packed_layer_info = {"a": (0, 128)}
+    assert worker._use_member_identity(metadata)
+
+    # PP=1 has congruent local/remote regions and keeps the legacy route even
+    # when its allocator is hybrid or packed.
+    worker.pp_size = 1
+    assert not worker._use_member_identity(metadata)
+
+
+def test_attention_member_routing_rejects_decode_tp_fanout():
+    metadata = _agent_metadata([["a"]], [0xA000], [128])
+    worker = _member_worker([["a"]], {"a": 0})
+    worker.use_mla = False
+    worker.transfer_topo.get_engine_info.return_value.remote_tp_size = 2
+    worker.transfer_topo.tp_ratio.return_value = -2
+
+    with pytest.raises(NotImplementedError, match="decode TP greater"):
+        worker._validate_remote_agent_handshake(metadata, 2, MagicMock())
+
+
+def test_remote_cleanup_releases_member_handle():
+    worker = _StubWriterWorker.fresh()
+    worker.nixl_wrapper = MagicMock()
+    worker._remote_agents = {"remote": {(0, 0): "agent"}}
+    worker.dst_xfer_side_handles = {"remote": {0: 11}}
+    worker._member_xfer_state = {
+        "remote": _MemberTransferState(
+            handle=22,
+            plan=MemberTransferPlan(
+                member_names=("a",),
+                local_regions=(0,),
+                group_ids=(0,),
+            ),
+        )
+    }
+    worker.kv_caches_base_addr = {"remote": {0: [0x1000]}}
+    worker.dst_num_blocks = {"remote": 2}
+    worker.tp_mappings = {"remote": MagicMock()}
+    worker.transfer_topo = MagicMock()
+    worker._engine_last_active = {}
+    worker._engine_clock_offset = {}
+
+    worker._cleanup_remote_engine("remote")
+
+    released = [
+        call.args[0] for call in worker.nixl_wrapper.release_dlist_handle.call_args_list
+    ]
+    assert released == [11, 22]
+    assert "remote" not in worker._member_xfer_state
+    worker.nixl_wrapper.remove_remote_agent.assert_called_once_with("agent")
+
+
+def test_member_state_rejects_divergent_remote_ranks():
+    worker = _StubWriterWorker.fresh()
+    worker.register_local_xfer_handler = MagicMock(return_value=(99, []))
+    plan_a = MemberTransferPlan(
+        member_names=("a", "b"),
+        local_regions=(0, 1),
+        group_ids=(0, 1),
+    )
+    plan_b = MemberTransferPlan(
+        member_names=("b", "a"),
+        local_regions=(1, 0),
+        group_ids=(1, 0),
+    )
+
+    worker._register_member_state("eng", plan_a, 16)
+    assert worker._member_xfer_state["eng"].handle == 99
+    # A matching later rank passes the consistency check and reuses the handle.
+    worker._check_member_plan_consistency("eng", plan_a)
+    worker._register_member_state("eng", plan_a, 16)
+    worker.register_local_xfer_handler.assert_called_once()
+    # A rank whose member order differs is rejected before any registration.
+    with pytest.raises(RuntimeError, match="inconsistent member layouts"):
+        worker._check_member_plan_consistency("eng", plan_b)
+
+
+class TestMemberIdentityWithMamba:
+    """Member-major descriptors for a KDA+MLA style hybrid under PP push.
+
+    Under HMA the allocator pools one layer from each kv_cache_group into a
+    shared tensor, so a single region backs both an attention layer and an SSM
+    layer. They are different members, read with different strides, and the
+    registered descriptor list keeps the region-major layout's two halves:
+
+        [ attention members x num_blocks | SSM members x regions_per_layer x
+          logical_blocks ]
+
+    which is what these pin. Getting the halves wrong does not crash: it
+    delivers mispaired KV and the throughput numbers stay plausible.
+    """
+
+    @staticmethod
+    def _hybrid_worker(conv_offsets: int = 3):
+        w = _StubWriterWorker.fresh()
+        w._has_mamba = True
+        w.num_regions = 2
+        w._group_spec_types = (FullAttentionSpec, MambaSpec)
+        w.block_len_per_layer = [128, 128]
+        w._conv_decomp = SimpleNamespace(
+            local_conv_offsets=[(0, 8)] * conv_offsets
+        )
+        return w
+
+    def test_attention_and_ssm_members_land_in_their_own_half(self):
+        w = self._hybrid_worker()
+        # 2 regions x 4 ssm regions/layer = 8 SSM regions; one attention member
+        # and one SSM member, in that plan order.
+        desc_ids = w._compute_desc_ids(
+            block_ids=[[1, 2], [5]],
+            dst_num_blocks=10,
+            block_size_ratio=None,
+            physical_blocks_per_logical=1,
+            region_group_ids=(0, 1),
+        )
+        # attention member: ordinal 0 -> blocks as-is.
+        # SSM member: ordinal 0 -> 4 sub-regions after num_fa_descs = 1*10.
+        assert desc_ids.tolist() == [1, 2, 10 + 5, 20 + 5, 30 + 5, 40 + 5]
+
+    def test_ssm_member_ordinals_do_not_collide(self):
+        w = self._hybrid_worker()
+        w._group_spec_types = (FullAttentionSpec, MambaSpec, MambaSpec)
+        desc_ids = w._compute_desc_ids(
+            block_ids=[[0], [1], [2]],
+            dst_num_blocks=4,
+            block_size_ratio=None,
+            physical_blocks_per_logical=1,
+            region_group_ids=(0, 1, 2),
+        )
+        fa = [0]
+        first = [4 + k * 4 + 1 for k in range(4)]
+        second = [4 + (4 + k) * 4 + 2 for k in range(4)]
+        assert desc_ids.tolist() == fa + first + second
+
+    def test_ssm_descs_are_not_ratio_expanded(self):
+        """SSM state blocks are indivisible: the attention half expands with
+        block_size_ratio, the SSM half never does."""
+        w = self._hybrid_worker()
+        desc_ids = w._compute_desc_ids(
+            block_ids=[[1], [1]],
+            dst_num_blocks=4,
+            block_size_ratio=2,
+            physical_blocks_per_logical=2,
+            region_group_ids=(0, 1),
+        )
+        # attention: num_blocks = 4*2 = 8, member 0 -> [1]
+        # ssm: logical_blocks = 4//2 = 2, after num_fa_descs = 1*8
+        assert desc_ids.tolist() == [1] + [8 + k * 2 + 1 for k in range(4)]
