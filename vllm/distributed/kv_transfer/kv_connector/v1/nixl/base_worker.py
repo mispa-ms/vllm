@@ -172,8 +172,9 @@ class NixlBaseConnectorWorker:
                         + ssm_ordinal * regions_per_ssm_layer
                     )[:, None]
                     out.append(
-                        (sub * logical_blocks + group_arr[None, :] + num_fa_descs)
-                        .flatten()
+                        (
+                            sub * logical_blocks + group_arr[None, :] + num_fa_descs
+                        ).flatten()
                     )
                     ssm_ordinal += 1
             return np.concatenate(out) if out else np.empty(0, dtype=np.int64)
@@ -350,6 +351,16 @@ class NixlBaseConnectorWorker:
         """NIXL regions an SSM layer occupies: conv sub-projections + temporal."""
         assert self._conv_decomp is not None
         return len(self._conv_decomp.local_conv_offsets) + 1
+
+    def _tracks_region_members(self) -> bool:
+        """Whether register_kv_caches advertises per-region layer members.
+
+        Must be implied by ``_requires_member_identity``: a worker that routes
+        by member identity but advertises no members hands its peer an empty
+        ``region_members`` and fails the handshake. The two were separate
+        expressions once and drifted, which made every K3 PP arm unstartable.
+        """
+        return self._supports_member_identity and self._is_hma_required
 
     def _requires_member_identity(self) -> bool:
         """Whether this worker's local layout must be routed by layer name.
@@ -1260,7 +1271,11 @@ class NixlBaseConnectorWorker:
         self.num_descs = self.num_blocks
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = [base_addr]
 
-        self._region_is_mla = [True]
+        # The packed region is REPLICATE only when it really is MLA. This path is
+        # shared with pull and with PP=1 push, where use_uniform_kv_cache() admits
+        # any uniform AttentionSpec -- GQA included -- so hardcoding True would
+        # silently drop the heterogeneous-TP head-slice offset for those.
+        self._region_is_mla = [self.use_mla]
         self._set_region_members([list(member_layouts)])
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
@@ -1380,11 +1395,7 @@ class NixlBaseConnectorWorker:
         # With hybrid allocator, layers can share a kv cache tensor
         seen_base_addresses: list[int] = []
 
-        track_region_members = (
-            self._supports_member_identity
-            and self._is_hma_required
-            and not self._has_mamba
-        )
+        track_region_members = self._tracks_region_members()
         region_members: list[list[str]] = []
 
         # K and V are packed into the content dim, so each attention layer is a
@@ -1739,7 +1750,10 @@ class NixlBaseConnectorWorker:
             # for it here would double-count the region.
             attention_positions, _ = self._member_kind_indices(member_plan)
             region_iter = [
-                (member_plan.local_regions[p], base_addresses[member_plan.local_regions[p]])
+                (
+                    member_plan.local_regions[p],
+                    base_addresses[member_plan.local_regions[p]],
+                )
                 for p in attention_positions
             ]
         parts: list[np.ndarray] = []
@@ -1865,10 +1879,9 @@ class NixlBaseConnectorWorker:
                 assert self.num_descs * block_size_ratio == len(blocks_data)
             else:
                 attention_positions, _ = self._member_kind_indices(member_plan)
-                assert (
-                    len(attention_positions) * self.num_blocks * block_size_ratio
-                    == len(blocks_data)
-                )
+                assert len(
+                    attention_positions
+                ) * self.num_blocks * block_size_ratio == len(blocks_data)
             # TODO (ZhanqiuHu): For homogeneous TP (tp_ratio == 1), the 3-descs split
             # is unnecessary — a single conv desc per block suffices.  Consider
             # adding a fast path that falls back to the standard 2-region
@@ -2124,9 +2137,17 @@ class NixlBaseConnectorWorker:
         block_size_ratio = self.transfer_topo.block_size_ratio(
             nixl_agent_meta.block_size
         )
-        if member_plan is not None and tp_ratio < 0 and not self.use_mla:
+        if (
+            member_plan is not None
+            and tp_ratio < 0
+            and (self._has_mamba or not self.use_mla)
+        ):
+            # Member routing always uses the unsplit local handle
+            # (push_worker._xfer_blocks), so the per-rank SSM chunking that
+            # _build_local_splits_from_plan would have produced is skipped while
+            # _build_mamba_remote still reads at the per-rank size.
             raise NotImplementedError(
-                "Attention-HMA push does not support decode TP greater than "
+                "Member-identity push does not support decode TP greater than "
                 "prefill TP yet"
             )
         # num_kv_heads > tp_size with P_TP > D_TP not supported for non-mamba.
@@ -2230,12 +2251,25 @@ class NixlBaseConnectorWorker:
             # match up to the kernel block size ratio even under
             # heterogeneous TP (remote kernel blocks may be smaller).
             # SSM geometry is validated via ssm_sizes/conv offsets instead.
-            assert self.block_len_per_layer == [
+            #
+            # Under member routing the remote lengths arrive member-ordered
+            # (plan_member_transfer rewrites them), and members outnumber
+            # regions under HMA pooling, so the local side must be expanded the
+            # same way before comparing.
+            local_block_lens = (
+                [
+                    self.block_len_per_layer[region]
+                    for region in member_plan.local_regions
+                ]
+                if member_plan is not None
+                else self.block_len_per_layer
+            )
+            assert local_block_lens == [
                 block_len * block_size_ratio for block_len in nixl_agent_meta.block_lens
             ], (
                 "Hybrid MLA kernel-granularity block lengths must match "
                 f"between P and D (block_size_ratio={block_size_ratio}): "
-                f"local={self.block_len_per_layer}, "
+                f"local={local_block_lens}, "
                 f"remote={nixl_agent_meta.block_lens}."
             )
         elif not self._has_mamba:

@@ -118,7 +118,10 @@ identity, so a PP-sharded prefiller can write into a `PP=1` decoder. See
 Current push PP + HMA limitations:
 
 - Only the prefiller (producer) may be PP-sharded; decode-side PP is not supported.
-- Hybrid SSM/Mamba layouts are not supported under PP.
+- Hybrid SSM/Mamba layouts are routed by member identity under PP push: an
+  SSM member contributes its conv sub-projection and temporal descriptors, an
+  attention member its FA descriptors. Decode TP greater than prefill TP is
+  not supported for them yet.
 - Packed (cross-layer) KV caches from a PP-sharded push producer are routed by member identity and are currently limited to MLA caches. Pull and `PP=1` push transfer packed caches whole-region regardless of attention type.
 - HMA requires the same block size on P and D.
 

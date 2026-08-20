@@ -223,7 +223,9 @@ Invariants enforced during expansion:
   handle is reused.
 
 Decode-side PP is unsupported because completions are counted per
-consumer rank. Mamba/SSM hybrids are unsupported under PP. Packed caches
+consumer rank. Mamba/SSM hybrids are routed by member identity like any other
+HMA layout, with their conv and temporal regions in the SSM half of the
+descriptor list. Packed caches
 from a PP-sharded push producer are routed by member identity and are
 currently limited to MLA caches. Pull and `PP=1` push transfer packed
 caches whole-region regardless of attention type.

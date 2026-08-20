@@ -1262,6 +1262,8 @@ class TestPushPrefixCaching:
         local, remote = self._written_block_ids(w)
         assert local == [10, 11, 12]
         assert remote == [500, 501, 502]
+
+
 def _agent_metadata(
     region_members: list[list[str]],
     base_addresses: list[int],
@@ -1431,9 +1433,7 @@ class TestMemberIdentityWithMamba:
         w.num_regions = 2
         w._group_spec_types = (FullAttentionSpec, MambaSpec)
         w.block_len_per_layer = [128, 128]
-        w._conv_decomp = SimpleNamespace(
-            local_conv_offsets=[(0, 8)] * conv_offsets
-        )
+        w._conv_decomp = SimpleNamespace(local_conv_offsets=[(0, 8)] * conv_offsets)
         return w
 
     def test_attention_and_ssm_members_land_in_their_own_half(self):
@@ -1480,3 +1480,52 @@ class TestMemberIdentityWithMamba:
         # attention: num_blocks = 4*2 = 8, member 0 -> [1]
         # ssm: logical_blocks = 4//2 = 2, after num_fa_descs = 1*8
         assert desc_ids.tolist() == [1] + [8 + k * 2 + 1 for k in range(4)]
+
+
+class TestMemberGatesAgree:
+    """`_requires_member_identity` must imply `_tracks_region_members`.
+
+    A worker that routes by member identity but advertises no members sends its
+    peer an empty `region_members`, and `_use_member_identity` then raises
+    rather than silently transferring stale KV. The two gates were separate
+    expressions and drifted: lifting the Mamba exclusion from one and not the
+    other left every K3 PP arm unstartable while the descriptor-level tests
+    stayed green, because they call `_compute_desc_ids` directly and never go
+    through registration.
+    """
+
+    @staticmethod
+    def _worker(*, hma: bool, mamba: bool, pp: int, packed: bool):
+        w = _StubWriterWorker.fresh()
+        w._is_hma_required = hma
+        w._has_mamba = mamba
+        w.pp_size = pp
+        w._packed_layer_info = {"l0": (0, 128)} if packed else {}
+        return w
+
+    @pytest.mark.parametrize("hma", [True, False])
+    @pytest.mark.parametrize("mamba", [True, False])
+    @pytest.mark.parametrize("pp", [1, 2])
+    @pytest.mark.parametrize("packed", [True, False])
+    def test_routing_implies_advertising(self, hma, mamba, pp, packed):
+        w = self._worker(hma=hma, mamba=mamba, pp=pp, packed=packed)
+        if w._requires_member_identity() and not packed:
+            # Packed registration advertises members through its own path
+            # (_register_packed_kv_cache), so only the pooled path is covered here.
+            assert w._tracks_region_members()
+
+    def test_kimi_k3_shape_routes_and_advertises(self):
+        """The shape this exists for: hybrid KDA+MLA, push, PP=2."""
+        w = self._worker(hma=True, mamba=True, pp=2, packed=False)
+        assert w._requires_member_identity()
+        assert w._tracks_region_members()
+
+    def test_pull_worker_neither_routes_nor_advertises(self):
+        w = object.__new__(NixlBaseConnectorWorker)
+        w._supports_member_identity = False
+        w._is_hma_required = True
+        w._has_mamba = True
+        w.pp_size = 2
+        w._packed_layer_info = {}
+        assert not w._requires_member_identity()
+        assert not w._tracks_region_members()
