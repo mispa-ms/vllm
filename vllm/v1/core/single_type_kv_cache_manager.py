@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -31,6 +32,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -1722,25 +1725,44 @@ class MambaManager(SingleTypeKVCacheManager):
         num_tokens: int,
     ) -> BlockHashWithGroupId | None:
         hash_block_size = self.block_pool.hash_block_size
-        if self.block_size == hash_block_size:
-            return None
-        if num_tokens % self.block_size == 0:
-            return None
-        if num_tokens % hash_block_size != 0:
-            return None
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
-        if num_tokens != latest_prompt_hash_boundary:
+        # A recurrent state exists only at the token count it was written at,
+        # so which boundary this stores -- or why it stores nothing -- decides
+        # what a later lookup can reach. Six early returns and no way to tell
+        # them apart from outside; name the one that fired for the first few.
+        skip = None
+        if self.block_size == hash_block_size:
+            skip = "block_size == hash_block_size"
+        elif num_tokens % self.block_size == 0:
+            skip = "on a block boundary, cached by the full-block path"
+        elif num_tokens % hash_block_size != 0:
+            skip = "not on a hash boundary"
+        elif num_tokens != latest_prompt_hash_boundary:
+            skip = "not the prompt's last hash boundary"
+        if skip is None:
+            block_idx = num_tokens // self.block_size
+            blocks = self.req_to_blocks[request.request_id]
+            if block_idx >= len(blocks):
+                skip = "block index past the request's blocks"
+            elif blocks[block_idx].is_null:
+                skip = "source block is null"
+        if _MambaTailTrace.want():
+            _MambaTailTrace.log(
+                num_tokens,
+                latest_prompt_hash_boundary,
+                self.block_size,
+                hash_block_size,
+                request.num_prompt_tokens,
+                skip,
+            )
+        if skip is not None:
             return None
 
         block_idx = num_tokens // self.block_size
         blocks = self.req_to_blocks[request.request_id]
-        if block_idx >= len(blocks):
-            return None
         source_block = blocks[block_idx]
-        if source_block.is_null:
-            return None
 
         partial_hash = self.block_pool.cache_partial_block(
             request=request,
@@ -1758,6 +1780,38 @@ class MambaManager(SingleTypeKVCacheManager):
             # allocate_new_blocks hands that block to the connector for offload.
             self._producer_partial_tail_reqs[request.request_id] = num_tokens
         return partial_hash
+
+
+class _MambaTailTrace:
+    """First few Mamba partial-tail decisions, named rather than inferred."""
+
+    _left = 20
+
+    @classmethod
+    def want(cls) -> bool:
+        return cls._left > 0
+
+    @classmethod
+    def log(
+        cls,
+        num_tokens: int,
+        boundary: int,
+        block_size: int,
+        hash_block_size: int,
+        num_prompt: int,
+        skip: str | None,
+    ) -> None:
+        cls._left -= 1
+        logger.info(
+            "Mamba partial tail: num_tokens=%d boundary=%d block=%d hash=%d "
+            "prompt=%d -> %s",
+            num_tokens,
+            boundary,
+            block_size,
+            hash_block_size,
+            num_prompt,
+            skip or "STORED",
+        )
 
 
 class CrossAttentionManager(SingleTypeKVCacheManager):

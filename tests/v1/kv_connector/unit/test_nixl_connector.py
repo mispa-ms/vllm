@@ -3451,3 +3451,134 @@ def test_explicit_kv_role_no_deprecation_warning(default_vllm_config, dist_init)
             mock_logger.warning_once.assert_not_called(),
             (f"kv_role={role!r} should not emit deprecation warning"),
         )
+
+
+def _worker_with_caches(pp_size, pp_rank=0):
+    """A registered worker with its stage identity forced, for handshake tests."""
+    kv_cache_config = make_kv_cache_config(block_size=16, num_blocks=2)
+    worker = NixlConnector(
+        create_vllm_config(model="facebook/opt-125m", block_size=16),
+        KVConnectorRole.WORKER,
+        kv_cache_config,
+    ).connector_worker
+    spec = cast(AttentionSpec, kv_cache_config.kv_cache_groups[0].kv_cache_spec)
+    shape = worker.attn_backends[0].get_kv_cache_shape(
+        num_blocks=kv_cache_config.num_blocks,
+        block_size=spec.block_size,
+        num_kv_heads=spec.num_kv_heads,
+        head_size=spec.head_size,
+    )
+    worker.register_kv_caches(
+        {
+            name: torch.zeros(*shape, dtype=spec.dtype)
+            for group in kv_cache_config.kv_cache_groups
+            for name in group.layer_names
+        }
+    )
+    worker.pp_size = pp_size
+    worker.pp_rank = pp_rank
+    return worker
+
+
+def _handshake_socket(worker):
+    meta = NixlAgentMetadata(
+        engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+        agent_metadata=FakeNixlWrapper.AGENT_METADATA,
+        kv_caches_base_addr=[0],
+        device_id=0,
+        num_blocks=1,
+        block_lens=[4096 * 16],
+        kv_cache_layout="HND",
+        block_size=16,
+        ssm_sizes=(0, 0),
+        attn_backend_name=worker.backend_name,
+        physical_blocks_per_logical_kv_block=1,
+    )
+    payload = NixlHandshakePayload(
+        compatibility_hash=worker.compat_hash,
+        agent_metadata_bytes=msgspec.msgpack.encode(meta),
+    )
+    sock = MagicMock()
+    sock.recv_multipart.return_value = [
+        msgspec.msgpack.encode(payload),
+        msgspec.msgpack.encode(time.perf_counter()),
+    ]
+    return sock
+
+
+@pytest.mark.parametrize(
+    "local_pp,remote_pp,supported",
+    [
+        (2, 1, True),
+        (2, 2, True),
+        (1, 2, False),
+        (2, 4, False),
+    ],
+)
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_asymmetric_pp_is_refused_by_name(
+    default_vllm_config, dist_init, local_pp, remote_pp, supported
+):
+    """An unsupported PP pairing fails with a message naming the topology.
+
+    plan_member_transfer requires every locally owned layer to be advertised,
+    so a partially overlapping peer would instead die on "missing locally owned
+    KV cache layer 'X'" -- a symptom that sends the reader hunting layer names.
+    That raise is a genuine layout-mismatch detector and stays as it is; this
+    refusal stops unsupported topologies from borrowing it.
+    """
+    worker = _worker_with_caches(local_pp)
+    sock = _handshake_socket(worker)
+
+    def run():
+        with (
+            patch.object(worker, "add_remote_agent", return_value="fake"),
+            patch.object(nixl.base_worker, "zmq_ctx") as ctx,
+        ):
+            ctx.return_value.__enter__.return_value = sock
+            return worker._nixl_handshake(
+                host="localhost",
+                port=1234,
+                remote_tp_size=1,
+                expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+                remote_pp_size=remote_pp,
+            )
+
+    if supported:
+        assert run() is not None
+    else:
+        with pytest.raises(NotImplementedError, match="Asymmetric pipeline"):
+            run()
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_notif_only_registration_is_not_refused(default_vllm_config, dist_init):
+    """The consumer half of a supported pair must not trip the producer's rule.
+
+    A PP=1 decoder registering a PP=2 prefiller's agents for notifs sees
+    local=1, remote=2 -- the shape the refusal rejects -- but it plans no member
+    transfer, so the rule does not apply. This is the working topology we
+    measured, seen from the other side.
+    """
+    worker = _worker_with_caches(1)
+    sock = _handshake_socket(worker)
+    with (
+        patch.object(worker, "_add_notif_only_remote_agent", return_value="fake"),
+        patch.object(nixl.base_worker, "zmq_ctx") as ctx,
+    ):
+        ctx.return_value.__enter__.return_value = sock
+        result, _ = worker._nixl_handshake(
+            host="localhost",
+            port=1234,
+            remote_tp_size=1,
+            expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+            remote_pp_size=2,
+            notif_agents_only=True,
+        )
+    assert set(result) == {(0, 0), (1, 0)}

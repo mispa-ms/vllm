@@ -991,6 +991,29 @@ class NixlBaseConnectorWorker:
         # than yielding an empty plan. Same rule the transfer and the notif
         # count use, so a stage we skip here is one we never write to or wait on.
         #
+        # Supported PP pairings, stated positively: the remote holds every
+        # layer (remote_pp_size == 1, so our window is a subset of its), or it
+        # is split exactly as we are (equal sizes, so stage p pairs with stage
+        # p). Anything else leaves a producer stage overlapping a consumer
+        # stage only partially, and plan_member_transfer has no way to express
+        # "write the part this stage owns" -- it requires every locally owned
+        # layer to be advertised and raises otherwise.
+        #
+        # Refuse it here, by name. The planner's raise stays what it is: a
+        # detector for a genuine layout mismatch. It earned that this week --
+        # it is what surfaced a speculative-config set on one side only -- and
+        # relaxing it into a skip would turn that into a silent accuracy loss.
+        # Letting an unsupported topology die on "missing locally owned KV
+        # cache layer 'X'" instead sends the next reader hunting layer names,
+        # which is exactly the afternoon this message exists to prevent.
+        if not notif_agents_only and remote_pp_size not in (1, self.pp_size):
+            raise NotImplementedError(
+                f"Asymmetric pipeline parallelism is not supported: this "
+                f"worker is stage {self.pp_rank} of {self.pp_size} and the "
+                f"peer reports {remote_pp_size} stages. Supported pairings are "
+                f"an unsharded peer or a peer split the same way."
+            )
+
         # Notif-only registration is exempt. It skips descriptor setup entirely,
         # so it never plans a member transfer and cannot hit that failure -- the
         # reason for filtering does not apply, and knowing every stage's agent
