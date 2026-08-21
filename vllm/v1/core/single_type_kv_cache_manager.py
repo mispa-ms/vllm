@@ -471,7 +471,25 @@ class SingleTypeKVCacheManager(ABC):
         # boundary is a no-op, and why what differs between a request that
         # recovers the previous chunk and one that recovers nothing has to be
         # either the marked set or the window the mask was asked for.
-        if isinstance(self.kv_cache_spec, MambaSpec) and _MambaTailTrace.want():
+        # Only the call whose window actually contains the wanted block, or one
+        # that marked something. cache_blocks runs incrementally as blocks fill
+        # -- windows arrive as [0,10), [10,20), ... -- and three earlier versions
+        # of this trace spent their whole budget before the window reached the
+        # boundary. This filter is not another guess: the previous run printed
+        # the wanted block and the window stride, so the condition is read off
+        # the data rather than assumed.
+        if (
+            isinstance(self.kv_cache_spec, MambaSpec)
+            and _MambaTailTrace.want()
+            and _MambaTailTrace.interesting(
+                reachable_boundaries,
+                num_cached_blocks,
+                num_full_blocks,
+                self.scheduler_block_size,
+                self.block_size,
+                block_mask,
+            )
+        ):
             _MambaTailTrace.log_mask(
                 reachable_boundaries,
                 num_cached_blocks,
@@ -1813,6 +1831,24 @@ class _MambaTailTrace:
     @classmethod
     def want(cls) -> bool:
         return cls._left > 0
+
+    @classmethod
+    def interesting(
+        cls,
+        boundaries: list[int],
+        start_block: int,
+        end_block: int,
+        alignment: int,
+        block_size: int,
+        mask: list[bool] | None,
+    ) -> bool:
+        """Whether this call could have retained the boundary block."""
+        if mask is None or any(mask):
+            return True
+        return any(
+            start_block <= b // alignment * alignment // block_size - 1 < end_block
+            for b in boundaries
+        )
 
     @classmethod
     def log_mask(
