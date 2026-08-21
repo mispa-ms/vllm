@@ -1748,7 +1748,13 @@ class MambaManager(SingleTypeKVCacheManager):
                 skip = "block index past the request's blocks"
             elif blocks[block_idx].is_null:
                 skip = "source block is null"
-        if _MambaTailTrace.want():
+        # Only the decisions near the prompt tail are informative. A first
+        # attempt logged every call and spent its whole budget on early chunks
+        # -- all of them multiples of the Mamba block and handled by the
+        # full-block path -- without ever reaching the boundary in question.
+        if skip != "on a block boundary, cached by the full-block path" and (
+            _MambaTailTrace.want()
+        ):
             _MambaTailTrace.log(
                 num_tokens,
                 latest_prompt_hash_boundary,
