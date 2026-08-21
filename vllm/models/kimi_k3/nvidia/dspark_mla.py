@@ -416,9 +416,22 @@ class K3DSparkForCausalLM(nn.Module):
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
-        target_layer_num = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
+        # The draft's layers are numbered from the end of the target's, and that
+        # number has to mean the same thing on every rank of every engine: KV
+        # layer names are the identity NIXL member routing transfers by, and a
+        # PP-sharded prefiller talking to a PP=1 decoder is two different ranks
+        # naming the same draft layer.
+        #
+        # get_num_layers is PP-*local* (end - start). At PP=2 over 93 layers,
+        # stage 1 reports 46, so its draft registers model.layers.46..50 while a
+        # PP=1 peer registers 93..97 -- and 46..50 also collide with that
+        # stage's own target layers 47..92. Symmetric PP hid it, because both
+        # sides computed the same wrong number.
+        #
+        # Upstream is the same shape in cohere_eagle and deepseek_eagle3. It was
+        # unreachable while spec decode under PP was refused outright; adopting
+        # #50514 is what made it reachable, so it is ours to get right.
+        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.model = K3DSparkModel(
             vllm_config=vllm_config,
             start_layer_id=target_layer_num,

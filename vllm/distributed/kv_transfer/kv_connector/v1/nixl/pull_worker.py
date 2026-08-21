@@ -38,6 +38,24 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        # Pull knows nothing about pipeline stages, in either direction. Its
+        # handshake never exchanges pp_size, so its transfer handles are looked
+        # up at stage 0 unconditionally -- a PP-sharded producer would be read
+        # only at its first stage -- and `consumers_per_producer` counts TP
+        # alone, so a PP-sharded consumer lets the producer free blocks after
+        # one stage's notif while the others are still reading. Neither fails
+        # loudly; both move or drop the wrong bytes.
+        #
+        # The PP work on this branch is push-only. Refusing here is what the
+        # docs already claim, and a startup error beats a silent bad transfer.
+        if self.pp_size > 1:
+            raise NotImplementedError(
+                "NixlConnector (pull) does not support "
+                f"pipeline_parallel_size > 1 (got {self.pp_size}); its "
+                "handshake carries no stage information, so transfers would "
+                "address stage 0 and completions would be undercounted. Use "
+                "NixlPushConnector for pipeline parallelism."
+            )
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """

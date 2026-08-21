@@ -261,3 +261,55 @@ class TestNonOverlappingStagesAreNotPlannable:
         """P_PP2 s0 against D_PP4 s0: D holds a strict subset of P's window."""
         with pytest.raises(RuntimeError, match="missing locally owned KV cache"):
             self._plan(self._stage(0, 2), self._stage(0, 4))
+
+
+class TestDraftLayerNumberingIsPPInvariant:
+    """Draft KV layer names must not depend on how the model is PP-sharded.
+
+    Member routing transfers by layer name, so a name is a contract between two
+    engines that may be sharded differently. Numbering the draft from the
+    PP-*local* layer count breaks it two ways at once, and this pins both.
+
+    Not a test of the connector -- a test of the rule the connector depends on.
+    The failure it guards against (AIB 63781036) was a prefiller at PP=2 asking
+    a PP=1 decoder for 'model.layers.46.self_attn', a name only its own stage
+    used; symmetric PP passed because both sides were wrong identically.
+    """
+
+    TOTAL = 93
+    DRAFT = 5
+
+    @staticmethod
+    def _local_count(total, rank, size):
+        from vllm.distributed.utils import get_pp_indices
+
+        start, end = get_pp_indices(total, rank, size)
+        return end - start
+
+    @pytest.mark.parametrize("pp_size", [1, 2, 4])
+    def test_total_based_numbering_never_collides_with_target_layers(self, pp_size):
+        draft = set(range(self.TOTAL, self.TOTAL + self.DRAFT))
+        assert draft.isdisjoint(range(self.TOTAL))
+        # and every stage agrees on the same names
+        assert all(
+            set(range(self.TOTAL, self.TOTAL + self.DRAFT)) == draft
+            for _ in range(pp_size)
+        )
+
+    def test_pp_local_numbering_collides_with_the_stages_own_layers(self):
+        """The old expression, kept so the bug cannot come back unnoticed."""
+        from vllm.distributed.utils import get_pp_indices
+
+        start, end = get_pp_indices(self.TOTAL, 1, 2)
+        local = self._local_count(self.TOTAL, 1, 2)
+        draft = set(range(local, local + self.DRAFT))
+        assert not draft.isdisjoint(range(start, end)), (
+            "PP-local numbering is supposed to collide -- if this passes, the "
+            "premise of the fix changed"
+        )
+
+    def test_pp_local_numbering_differs_between_a_sharded_and_unsharded_peer(self):
+        sharded = self._local_count(self.TOTAL, 1, 2)
+        unsharded = self._local_count(self.TOTAL, 0, 1)
+        assert sharded != unsharded
+        assert self.TOTAL == unsharded  # the value the fix uses, on both peers

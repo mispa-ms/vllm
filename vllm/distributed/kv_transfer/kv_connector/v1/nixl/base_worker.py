@@ -365,8 +365,14 @@ class NixlBaseConnectorWorker:
 
         Resolved lazily: ``get_pp_group()`` asserts the group is initialized,
         which is not true at worker ``__init__`` on every path, so reading it
-        there turns an unrelated config into a crash. Falls back to the rank
-        layout -- TP is innermost, so stage = rank // tp_size.
+        there turns an unrelated config into a crash.
+
+        The fallback derives the stage from the rank layout, which
+        ``initialize_model_parallel`` documents as
+        ``ExternalDP x DP x PP x PCP x TP``. Dividing by TP alone was right only
+        when PCP and DP were both 1 -- under DP>1, which is how K3 runs with EP,
+        it returns a stage index off by a multiple of pp_size, and the value is
+        cached, so every later transfer inherits it.
         """
         if self.pp_size == 1:
             return 0
@@ -374,7 +380,10 @@ class NixlBaseConnectorWorker:
             return get_pp_group().rank_in_group
         except AssertionError:
             parallel = self.vllm_config.parallel_config
-            return parallel.rank // max(1, parallel.tensor_parallel_size)
+            inner = max(1, parallel.prefill_context_parallel_size) * max(
+                1, parallel.tensor_parallel_size
+            )
+            return (parallel.rank // inner) % self.pp_size
 
     def _overlapping_remote_pp_stages(self, remote_pp_size: int) -> int:
         """How many remote PP stages hold layers this worker also holds.
@@ -419,8 +428,18 @@ class NixlBaseConnectorWorker:
         by member identity but advertises no members hands its peer an empty
         ``region_members`` and fails the handshake. The two were separate
         expressions once and drifted, which made every K3 PP arm unstartable.
+
+        Deliberately wider than the routing gate. ``_is_hma_required`` is a
+        property of *this stage's* layers, so a stage holding only
+        full-attention layers reported False and advertised nothing -- while its
+        hybrid peer, which does need member identity, raised "remote peer
+        advertised no member metadata". Same for a packed layout, which routes
+        by member but is not HMA. Advertising members a peer never uses costs a
+        list of names in the handshake; not advertising them is a dead engine.
         """
-        return self._supports_member_identity and self._is_hma_required
+        return self._supports_member_identity and (
+            self._is_hma_required or bool(self._packed_layer_info) or self.pp_size > 1
+        )
 
     def _requires_member_identity(
         self, remote_region_members: Sequence[Sequence[str]] = ()
