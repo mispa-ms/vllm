@@ -312,4 +312,4 @@ class TestDraftLayerNumberingIsPPInvariant:
         sharded = self._local_count(self.TOTAL, 1, 2)
         unsharded = self._local_count(self.TOTAL, 0, 1)
         assert sharded != unsharded
-        assert self.TOTAL == unsharded  # the value the fix uses, on both peers
+        assert unsharded == self.TOTAL  # the value the fix uses, on both peers

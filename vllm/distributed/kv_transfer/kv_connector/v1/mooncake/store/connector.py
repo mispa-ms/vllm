@@ -117,7 +117,6 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
                     f"{cache_block_size} (mamba_cache_mode != 'align')"
                 )
         pcp = vllm_config.parallel_config.prefill_context_parallel_size
-        dcp = vllm_config.parallel_config.decode_context_parallel_size
         # DCP with hybrid attention is supported: the worker now puts every
         # group's block size into the scheduler's coordinate space -- attention
         # groups scaled by dcp, Mamba groups not, the rule
