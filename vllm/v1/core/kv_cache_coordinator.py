@@ -108,6 +108,7 @@ class KVCacheCoordinator(ABC):
 
         # KV cache group indices that get the EAGLE last-block drop.
         self._hit_reconcile_logs = 0
+        self._hit_reconcile_misses = 0
         self.eagle_group_ids: set[int] = {
             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
         }
@@ -910,7 +911,23 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # hypothesis the log exists to test. ``max_len`` is the candidate the
         # group was asked for and ``hit`` what it returned, so a uniform
         # shortening is visible as every group losing the same amount.
-        if self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS and _trace:
+        # Only reconciliations that produced a hit. Every previous run spent its
+        # whole budget on wave-1 cold lookups, where every group returns 0 and
+        # the trace says nothing about which group decides a hit. Count the
+        # misses separately so their absence from the log is not read as their
+        # absence from the run.
+        if hit_length == 0:
+            self._hit_reconcile_misses += 1
+            if self._hit_reconcile_misses in (1, 100, 1000):
+                logger.info(
+                    "Prefix hit reconciled to 0 (%d such so far)",
+                    self._hit_reconcile_misses,
+                )
+        if (
+            hit_length > 0
+            and self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS
+            and _trace
+        ):
             self._hit_reconcile_logs += 1
             # ``align`` and ``partial`` decide the granularity a hit can land
             # on, and they are the difference a length alone cannot show:
