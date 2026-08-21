@@ -455,20 +455,6 @@ class SingleTypeKVCacheManager(ABC):
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
-        # Which full-block boundaries survive retention, and how many there are
-        # to fall back to. The partial-tail trace shows only the sub-block entry,
-        # so a request that cannot reach it is invisible here: whether the next
-        # boundary down was kept is exactly the blind spot. At most two are
-        # retained, and the second only when shared_prefix_boundary is set.
-        if isinstance(self.kv_cache_spec, MambaSpec) and _MambaTailTrace.want():
-            _MambaTailTrace.log_boundaries(
-                reachable_boundaries,
-                num_cached_blocks,
-                num_full_blocks,
-                self.block_size,
-                self.use_eagle,
-            )
-
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
@@ -478,6 +464,23 @@ class SingleTypeKVCacheManager(ABC):
             retention_interval=retention_interval,
             reachable_boundaries=reachable_boundaries,
         )
+        # The output, not the input. Boundaries are identical across requests --
+        # both arms log a single one at num_prompt-1 -- and each is floored to
+        # alignment_tokens before it picks a block, so two boundaries an eagle
+        # drop apart collapse onto the same block. That is why adding one more
+        # boundary is a no-op, and why what differs between a request that
+        # recovers the previous chunk and one that recovers nothing has to be
+        # either the marked set or the window the mask was asked for.
+        if isinstance(self.kv_cache_spec, MambaSpec) and _MambaTailTrace.want():
+            _MambaTailTrace.log_mask(
+                reachable_boundaries,
+                num_cached_blocks,
+                num_full_blocks,
+                self.scheduler_block_size,
+                self.block_size,
+                self.use_eagle,
+                block_mask,
+            )
         self.block_pool.cache_full_blocks(
             request=request,
             blocks=self.req_to_blocks[request.request_id],
@@ -1812,21 +1815,31 @@ class _MambaTailTrace:
         return cls._left > 0
 
     @classmethod
-    def log_boundaries(
+    def log_mask(
         cls,
         boundaries: list[int],
         start_block: int,
         end_block: int,
+        alignment: int,
         block_size: int,
         use_eagle: bool,
+        mask: list[bool] | None,
     ) -> None:
         cls._left -= 1
+        marked = (
+            "dense"
+            if mask is None
+            else [i + start_block for i, m in enumerate(mask) if m]
+        )
+        want = [b // alignment * alignment // block_size - 1 for b in boundaries]
         logger.info(
-            "Mamba retained boundaries: %s (blocks %d..%d of %d tokens each, eagle=%s)",
+            "Mamba mask: boundaries=%s -> want blocks %s | window [%d,%d) | "
+            "marked %s | eagle=%s",
             boundaries,
+            want,
             start_block,
             end_block,
-            block_size,
+            marked,
             use_eagle,
         )
 
