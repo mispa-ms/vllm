@@ -1,0 +1,11 @@
+Pipeline:       63808114
+Config:         ci/sweep_configs/kimi-k3/vllm/kimi-k3-mxfp4/GB300/DISAGG/kimi-k3-mxfp4-gb300-disagg-1p1d-tp8dcp8pp2-tp8dcp8-pushpp-dspark-ret12288-c8-oci.yml
+Cluster:        oci-aga-slurm-1
+Total attempts: 1
+Total files:    26
+Report job:     406083915
+Collected at:   2026-08-21T04:59:31Z
+
+--- Per-Attempt Status ---
+
+Attempt 1 (job 406083914) — success  |  26 files  |  2026-08-21T04:59:21Z

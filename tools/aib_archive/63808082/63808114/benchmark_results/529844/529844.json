@@ -1,0 +1,99 @@
+{
+  "version": "2.0",
+  "orchestrator": true,
+  "job_id": "529844",
+  "job_name": "kimi-k3-mxfp4-gb300-disagg-1p1d-tp8dcp8pp2-tp8dcp8-pushpp-dspark-ret12288-c8-oci",
+  "generated_at": "2026-08-21 04:22:02",
+  "model": {
+    "path": "hf:moonshotai/Kimi-K3",
+    "container": "vllm/vllm-openai:nightly-5a4c8d99242e9e069b604d0e9b969e77f7dd501d",
+    "precision": "fp4"
+  },
+  "resources": {
+    "gpu_type": "gb300",
+    "gpus_per_node": 4,
+    "prefill_nodes": 4,
+    "decode_nodes": 2,
+    "agg_nodes": null,
+    "prefill_workers": 1,
+    "decode_workers": 1,
+    "agg_workers": 0,
+    "gpus_per_prefill": 16,
+    "gpus_per_decode": 8,
+    "gpus_per_agg": 4,
+    "cpu_allocation": {
+      "allocated_total": 864,
+      "allocated_per_node": [
+        144,
+        144,
+        144,
+        144,
+        144,
+        144
+      ],
+      "current_node_allocated": 144,
+      "process_affinity_count": 144,
+      "process_affinity_list": "0-143",
+      "effective_for_check": 144,
+      "backend_node_allocations": [
+        {
+          "node": "nvl72d143-T09",
+          "allocated_cpus": 144,
+          "backend_gpus": 4
+        },
+        {
+          "node": "nvl72d143-T10",
+          "allocated_cpus": 144,
+          "backend_gpus": 4
+        },
+        {
+          "node": "nvl72d143-T11",
+          "allocated_cpus": 144,
+          "backend_gpus": 4
+        },
+        {
+          "node": "nvl72d143-T12",
+          "allocated_cpus": 144,
+          "backend_gpus": 4
+        },
+        {
+          "node": "nvl72d143-T13",
+          "allocated_cpus": 144,
+          "backend_gpus": 4
+        },
+        {
+          "node": "nvl72d143-T14",
+          "allocated_cpus": 144,
+          "backend_gpus": 4
+        }
+      ]
+    },
+    "cpu_check": {
+      "status": "ok",
+      "gpu_count_basis": 4,
+      "minimum_cpu_count": 4,
+      "available_cpu_count": 144,
+      "available_cpu_source": "minimum_backend_node_allocation",
+      "node": "nvl72d143-T09",
+      "message": "Effective CPU capacity meets the baseline on backend node nvl72d143-T09: 144 CPUs for 4 backend GPUs (minimum 4)."
+    }
+  },
+  "backend_type": "vllm",
+  "frontend_type": "dynamo",
+  "benchmark": {
+    "type": "custom",
+    "isl": null,
+    "osl": null
+  },
+  "tags": [
+    "batch",
+    "ibdb_author=misunp",
+    "ibdb_experiment_id=kimi-k3-mxfp4-gb300-disagg-1p1d-tp8dcp8pp2-tp8dcp8-pushpp-dspark-ret12288-c8-oci",
+    "ibdb_opt_target=out-of-the-box",
+    "ibdb_precision=fp4",
+    "ibdb_study_id=sa-agentx-kimi-k3-vllm",
+    "s_ibdb_record_id=https://gitlab-master.nvidia.com/compute/anna/infrastructure/AIB/-/pipelines/63808082",
+    "s_ibdb_epipeline_id=63808082"
+  ],
+  "setup_script": "kimi-k3-gb300-pp.sh"
+}

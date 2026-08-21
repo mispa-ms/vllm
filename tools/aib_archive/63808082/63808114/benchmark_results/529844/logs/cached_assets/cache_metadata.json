@@ -1,0 +1,18 @@
+{
+  "node_metrics": {
+    "source_hashes": {
+      "benchmark.out": "b70b75bc43e959467f4cbbcc6f0a5d5b",
+      "model_download.out": "bd2e98d4051547b6e36ea4e248393a1d",
+      "nvl72d143-T10_prefill_w0.out": "ae36a4471f2ef2d4379414cd3c959ca8",
+      "nvl72d143-T09_prefill_w0.out": "c6edae136641a3c87c860fd13909af10",
+      "nvl72d143-T11_prefill_w0.out": "17974423a8641853bc0197a036546165",
+      "infra.out": "f845eb8376e4c91ffa585d6401290347",
+      "nvl72d143-T13_decode_w0.out": "b718c407d530a3849ddd453194ac0b7c",
+      "nvl72d143-T12_prefill_w0.out": "ac9ad2982069b8ed275b1e8fc782a4dc",
+      "nvl72d143-T14_decode_w0.out": "5960ff2c990aa9722646e9e40d582397",
+      "nvl72d143-T09_frontend_0.out": "5584c4907bee077229de6f24673d38d1"
+    },
+    "cached_at": "2026-08-20T21:58:45.776528",
+    "row_count": 0
+  }
+}

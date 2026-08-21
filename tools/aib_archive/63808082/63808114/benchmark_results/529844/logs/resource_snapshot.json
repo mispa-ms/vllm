@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "captured_at": "2026-08-21T04:38:01Z",
+  "job_id": "529844",
+  "hardware": {
+    "architecture": "aarch64",
+    "cpu_model": "ARM CPU implementer 0x41 part 0xd4f (architecture 8, variant 0x0, revision 0)",
+    "host_logical_cpus": 144
+  },
+  "nodes": {
+    "count": 6,
+    "names": [
+      "nvl72d143-T09",
+      "nvl72d143-T10",
+      "nvl72d143-T11",
+      "nvl72d143-T12",
+      "nvl72d143-T13",
+      "nvl72d143-T14"
+    ]
+  },
+  "gpus": {
+    "type": "gb300",
+    "configured_per_node": 4,
+    "configured_total": 24,
+    "backend_total": 24
+  },
+  "cpus": {
+    "allocated_total": 864,
+    "allocated_per_node": [
+      144,
+      144,
+      144,
+      144,
+      144,
+      144
+    ],
+    "current_node_allocated": 144,
+    "process_affinity_count": 144,
+    "process_affinity_list": "0-143",
+    "effective_for_check": 144,
+    "backend_node_allocations": [
+      {
+        "node": "nvl72d143-T09",
+        "allocated_cpus": 144,
+        "backend_gpus": 4
+      },
+      {
+        "node": "nvl72d143-T10",
+        "allocated_cpus": 144,
+        "backend_gpus": 4
+      },
+      {
+        "node": "nvl72d143-T11",
+        "allocated_cpus": 144,
+        "backend_gpus": 4
+      },
+      {
+        "node": "nvl72d143-T12",
+        "allocated_cpus": 144,
+        "backend_gpus": 4
+      },
+      {
+        "node": "nvl72d143-T13",
+        "allocated_cpus": 144,
+        "backend_gpus": 4
+      },
+      {
+        "node": "nvl72d143-T14",
+        "allocated_cpus": 144,
+        "backend_gpus": 4
+      }
+    ]
+  },
+  "slurm_environment": {
+    "SLURM_CPUS_ON_NODE": "144",
+    "SLURM_CPUS_PER_TASK": "72",
+    "SLURM_JOB_CPUS_PER_NODE": "144(x6)",
+    "SLURM_GPUS_ON_NODE": "4",
+    "SLURM_JOB_GPUS": "0,1,2,3",
+    "SLURM_NTASKS": "6",
+    "SLURM_TRES_PER_TASK": "cpu=72"
+  },
+  "cpu_check": {
+    "status": "ok",
+    "gpu_count_basis": 4,
+    "minimum_cpu_count": 4,
+    "available_cpu_count": 144,
+    "available_cpu_source": "minimum_backend_node_allocation",
+    "node": "nvl72d143-T09",
+    "message": "Effective CPU capacity meets the baseline on backend node nvl72d143-T09: 144 CPUs for 4 backend GPUs (minimum 4)."
+  }
+}

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -27,6 +28,9 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Enough reconciliations to name the capping group without filling a log.
+_MAX_HIT_RECONCILE_LOGS = 20
 
 
 def _validate_prefix_cache_retention_interval(
@@ -104,6 +108,7 @@ class KVCacheCoordinator(ABC):
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
+        self._hit_reconcile_logs = 0
         self.eagle_group_ids: set[int] = {
             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
         }
@@ -886,6 +891,34 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_blocks = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
+        # The reconciled hit is a min across attention groups, so one short
+        # group caps every other. That is invisible in the aggregate hit-rate
+        # counter, which is what a DSpark arm losing half its prefix cache looks
+        # like from outside. Log the per-group lengths for the first few
+        # reconciliations that actually lose something -- enough to name the
+        # group, cheap enough to leave on.
+        if (
+            logger.isEnabledFor(logging.INFO)
+            and self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS
+            and longest_hit_length > hit_length
+        ):
+            self._hit_reconcile_logs += 1
+            per_group = [
+                (
+                    i,
+                    type(self.single_type_managers[i].kv_cache_spec).__name__,
+                    self.single_type_managers[i].block_size,
+                    hit_length_by_group[i],
+                )
+                for i in range(len(hit_length_by_group))
+            ]
+            logger.info(
+                "Prefix hit reconciled to %d of %d tokens; per group "
+                "(id, spec, block_size, hit): %s",
+                hit_length,
+                longest_hit_length,
+                per_group,
+            )
         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
 
     def find_longest_cache_hit_per_group(
