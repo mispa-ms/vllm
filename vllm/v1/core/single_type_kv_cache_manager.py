@@ -455,6 +455,20 @@ class SingleTypeKVCacheManager(ABC):
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
+        # Which full-block boundaries survive retention, and how many there are
+        # to fall back to. The partial-tail trace shows only the sub-block entry,
+        # so a request that cannot reach it is invisible here: whether the next
+        # boundary down was kept is exactly the blind spot. At most two are
+        # retained, and the second only when shared_prefix_boundary is set.
+        if isinstance(self.kv_cache_spec, MambaSpec) and _MambaTailTrace.want():
+            _MambaTailTrace.log_boundaries(
+                reachable_boundaries,
+                num_cached_blocks,
+                num_full_blocks,
+                self.block_size,
+                self.use_eagle,
+            )
+
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
@@ -1796,6 +1810,25 @@ class _MambaTailTrace:
     @classmethod
     def want(cls) -> bool:
         return cls._left > 0
+
+    @classmethod
+    def log_boundaries(
+        cls,
+        boundaries: list[int],
+        start_block: int,
+        end_block: int,
+        block_size: int,
+        use_eagle: bool,
+    ) -> None:
+        cls._left -= 1
+        logger.info(
+            "Mamba retained boundaries: %s (blocks %d..%d of %d tokens each, eagle=%s)",
+            boundaries,
+            start_block,
+            end_block,
+            block_size,
+            use_eagle,
+        )
 
     @classmethod
     def log(
