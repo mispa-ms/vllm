@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -787,6 +786,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
         longest_hit_length = 0
+        _trace: list[tuple] = []
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
         hit_length_by_group: list[int] = [0] * num_groups
 
@@ -859,6 +859,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 elif _new_hit_length < curr_hit_length:
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
+                if self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS:
+                    _trace.append(
+                        (
+                            idx,
+                            type(spec).__name__,
+                            self.single_type_managers[first_group_id].block_size,
+                            _max_length,
+                            _new_hit_length,
+                            drop_eagle_block,
+                        )
+                    )
                 curr_hit_length = _new_hit_length
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
@@ -891,40 +902,23 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_blocks = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
-        # The reconciled hit is a min across attention groups, so one short
-        # group caps every other. That is invisible in the aggregate hit-rate
-        # counter, which is what a DSpark arm losing half its prefix cache looks
-        # like from outside. Log the per-group lengths for the first few
-        # reconciliations that actually lose something -- enough to name the
-        # group, cheap enough to leave on.
-        if (
-            logger.isEnabledFor(logging.INFO)
-            and self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS
-            and longest_hit_length > hit_length
-        ):
+        # Log the whole reconciliation, not only the cases that lose tokens to
+        # the min. Gating on ``longest > hit`` made silence ambiguous: the eagle
+        # drop is already folded into hit_length_by_group, and longest is a max
+        # over those post-drop values, so a run where *every* group is shortened
+        # equally has longest == hit and prints nothing -- which is exactly the
+        # hypothesis the log exists to test. ``max_len`` is the candidate the
+        # group was asked for and ``hit`` what it returned, so a uniform
+        # shortening is visible as every group losing the same amount.
+        if self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS and _trace:
             self._hit_reconcile_logs += 1
-            # ``eagle`` matters as much as the lengths. is_eagle_group is only
-            # ever set for deepseek_v4 (kv_cache_utils, behind its own FIXME),
-            # so on any other model with a draft the set comes up empty and the
-            # constructor's fallback flags *every* group. Then "the draft group
-            # hit short" and "every group took the eagle drop" produce the same
-            # truncation, and only this column tells them apart.
-            per_group = [
-                (
-                    i,
-                    type(self.single_type_managers[i].kv_cache_spec).__name__,
-                    self.single_type_managers[i].block_size,
-                    hit_length_by_group[i],
-                    i in self.eagle_group_ids,
-                )
-                for i in range(len(hit_length_by_group))
-            ]
             logger.info(
-                "Prefix hit reconciled to %d of %d tokens; per group "
-                "(id, spec, block_size, hit, eagle): %s",
+                "Prefix hit reconciled to %d of %d tokens (eagle groups: %s); "
+                "per group (idx, spec, block_size, max_len, hit, drop_eagle): %s",
                 hit_length,
                 longest_hit_length,
-                per_group,
+                sorted(self.eagle_group_ids),
+                _trace,
             )
         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
 
