@@ -34,7 +34,9 @@ class PendingRecv:
     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
 
 
-def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+def compute_need_sampled_mask(
+    input_batch: InputBatch, max_draft_tokens: int = 0
+) -> np.ndarray | None:
     """Return a bool array of shape `[input_batch.num_reqs]` marking requests
     with outputs that might be needed in a subsequent (decode) step.
     Returns None if no sampled outputs are needed in the requests' next step."""
@@ -52,11 +54,17 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
     # been scheduled. Comparing the inflated count against max_seq_len would
     # mark a request as finishing up to num_draft tokens early, after which the
     # last rank stops broadcasting and the other ranks' last_sampled_tokens
-    # freeze, silently repeating a stale token. Discount the drafts: a
-    # redundant broadcast costs one small collective, a skipped one corrupts.
-    finish_computed = old_computed
-    if input_batch.num_draft_tokens_per_req is not None:
-        finish_computed = old_computed - input_batch.num_draft_tokens_per_req
+    # freeze, silently repeating a stale token.
+    #
+    # Discount a fixed upper bound rather than this step's draft count. The
+    # inflation came from the *previous* step's drafts, and the two need not
+    # match: a request that was given four drafts and is given none now gets a
+    # discount of zero and finishes early -- the corruption above -- while the
+    # reverse over-discounts harmlessly. Only one direction is safe, so take
+    # the bound that is always at least the inflation. A redundant broadcast
+    # costs one small collective; a skipped one corrupts. The clamp below
+    # absorbs the over-subtraction.
+    finish_computed = old_computed - max_draft_tokens
     not_finishing = np.maximum(finish_computed, prefill_len) + 1 < max_seq_len
     need_sampled_mask = produces_sample & not_finishing
     return need_sampled_mask if need_sampled_mask.any() else None
@@ -158,7 +166,7 @@ class PPHandler:
         verifying real proposals against logits computed from placeholders.
         """
         assert self.is_last_rank
-        if compute_need_sampled_mask(input_batch) is None:
+        if compute_need_sampled_mask(input_batch, self.num_speculative_steps) is None:
             return
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
@@ -176,7 +184,7 @@ class PPHandler:
         sides gate on the same mask, so the wire order always matches.
         """
         assert not self.is_last_rank
-        if compute_need_sampled_mask(input_batch) is None:
+        if compute_need_sampled_mask(input_batch, self.num_speculative_steps) is None:
             return
         num_reqs = input_batch.num_reqs
         with torch.cuda.stream(self.broadcast_stream):
@@ -205,7 +213,9 @@ class PPHandler:
         """Returns True iff sampled tokens need to be gathered from *all*
         requests in the batch."""
         assert not self.is_last_rank
-        need_sampled_mask = compute_need_sampled_mask(input_batch)
+        need_sampled_mask = compute_need_sampled_mask(
+            input_batch, self.num_speculative_steps
+        )
         if need_sampled_mask is None:
             # Leave this step's reserved slot as None.
             return False
@@ -253,7 +263,7 @@ class PPHandler:
         input_batch: InputBatch,
     ) -> None:
         assert self.is_last_rank
-        if compute_need_sampled_mask(input_batch) is None:
+        if compute_need_sampled_mask(input_batch, self.num_speculative_steps) is None:
             # No request needs sampled outputs for a subsequent decode step.
             return
 
