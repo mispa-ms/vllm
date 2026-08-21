@@ -912,12 +912,23 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # shortening is visible as every group losing the same amount.
         if self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS and _trace:
             self._hit_reconcile_logs += 1
+            # ``align`` and ``partial`` decide the granularity a hit can land
+            # on, and they are the difference a length alone cannot show:
+            # 122880 is both 960 x 128 and 10 x 12288, so the observed hit is
+            # consistent with either the fine hash block or the coarse
+            # scheduler block. Printing the two settles it without another arm.
             logger.info(
-                "Prefix hit reconciled to %d of %d tokens (eagle groups: %s); "
-                "per group (idx, spec, block_size, max_len, hit, drop_eagle): %s",
+                "Prefix hit reconciled to %d of %d tokens "
+                "(eagle groups: %s, align=%d, partial_hash=%s, hash_block=%d, "
+                "sched_block=%d); per group "
+                "(idx, spec, block_size, max_len, hit, drop_eagle): %s",
                 hit_length,
                 longest_hit_length,
                 sorted(self.eagle_group_ids),
+                self._cache_hit_alignment_tokens,
+                self.enable_partial_hash_hits,
+                self.hash_block_size,
+                self.scheduler_block_size,
                 _trace,
             )
         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
