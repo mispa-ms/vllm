@@ -290,12 +290,28 @@ class SimpleCPUOffloadScheduler:
             remaining_hashes, max_hit_len
         )
 
-        # update_state_after_alloc() indexes whole scheduler blocks per group and
-        # asserts that contract. Partial hash hits can return a finer length --
-        # under DCP the full-attention block is dcp x the hash block, so a hybrid
-        # model reports multiples of the hash block -- so re-align here. The
-        # surplus blocks stay pinned and are released with the rest.
-        hit_length = hit_length // self.block_size * self.block_size
+        # update_state_after_alloc() indexes whole scheduler blocks per group,
+        # and a partial hash hit can be finer than that: under DCP a hybrid
+        # model reports multiples of the hash block, not of the scheduler
+        # block. Decline such a hit rather than round it down.
+        #
+        # Rounding down looks like it should work and does not. A Mamba group's
+        # hit list is tail-only -- ``[null] * block_idx + [cached]``, one real
+        # state at the end -- so the leading slice update_state_after_alloc
+        # takes keeps only nulls and drops the single block that carries the
+        # state, while the scheduler is told those tokens are computed. The
+        # recurrent state is then silently wrong. There is no shorter prefix to
+        # fall back to either: the state exists at the length it was written
+        # at and nowhere else.
+        if hit_length % self.block_size:
+            logger.warning_once(
+                "CPU offload declined a %d-token prefix hit: this manager "
+                "indexes whole scheduler blocks (%d tokens) and cannot "
+                "represent a partial hash hit.",
+                hit_length,
+                self.block_size,
+            )
+            return 0, False
         if hit_length > 0:
             pin_blocks = [
                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
