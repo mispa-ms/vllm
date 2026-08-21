@@ -903,18 +903,25 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             and longest_hit_length > hit_length
         ):
             self._hit_reconcile_logs += 1
+            # ``eagle`` matters as much as the lengths. is_eagle_group is only
+            # ever set for deepseek_v4 (kv_cache_utils, behind its own FIXME),
+            # so on any other model with a draft the set comes up empty and the
+            # constructor's fallback flags *every* group. Then "the draft group
+            # hit short" and "every group took the eagle drop" produce the same
+            # truncation, and only this column tells them apart.
             per_group = [
                 (
                     i,
                     type(self.single_type_managers[i].kv_cache_spec).__name__,
                     self.single_type_managers[i].block_size,
                     hit_length_by_group[i],
+                    i in self.eagle_group_ids,
                 )
                 for i in range(len(hit_length_by_group))
             ]
             logger.info(
                 "Prefix hit reconciled to %d of %d tokens; per group "
-                "(id, spec, block_size, hit): %s",
+                "(id, spec, block_size, hit, eagle): %s",
                 hit_length,
                 longest_hit_length,
                 per_group,
