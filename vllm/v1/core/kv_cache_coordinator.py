@@ -109,6 +109,7 @@ class KVCacheCoordinator(ABC):
         # KV cache group indices that get the EAGLE last-block drop.
         self._hit_reconcile_logs = 0
         self._hit_reconcile_misses = 0
+        self._hit_reconcile_collapses = 0
         self.eagle_group_ids: set[int] = {
             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
         }
@@ -861,6 +862,32 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
                 if self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS:
+                    # A group that returns 0 has two very different causes:
+                    # its blocks are not in the pool at all, or they are and
+                    # the ceiling it was handed cannot reach them. The pair
+                    # (max_len, hit) cannot tell those apart, and the retention
+                    # mask cannot settle it either -- the mask marks which
+                    # blocks *may* be cached, while cache_full_blocks decides
+                    # which ones are. Re-ask the same finder without the eagle
+                    # drop and without the ceiling; ``unbounded`` is then the
+                    # group's own reach, so unbounded > 0 with hit == 0 means
+                    # the blocks are there and the ceiling is the cause.
+                    unbounded = None
+                    if _new_hit_length == 0 and curr_hit_length > 0:
+                        _, unbounded = manager_cls.find_longest_cache_hit(
+                            block_hashes=block_hashes,
+                            max_length=max_cache_hit_length,
+                            kv_cache_group_ids=group_ids,
+                            block_pool=self.block_pool,
+                            kv_cache_spec=spec,
+                            drop_eagle_block=False,
+                            alignment_tokens=self._cache_hit_alignment_tokens,
+                            dcp_world_size=(
+                                self.dcp_world_size
+                                if isinstance(spec, FullAttentionSpec)
+                                else 1
+                            ),
+                        )
                     _trace.append(
                         (
                             idx,
@@ -869,6 +896,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                             _max_length,
                             _new_hit_length,
                             drop_eagle_block,
+                            unbounded,
                         )
                     )
                 curr_hit_length = _new_hit_length
@@ -903,28 +931,42 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_blocks = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
-        # Log the whole reconciliation, not only the cases that lose tokens to
-        # the min. Gating on ``longest > hit`` made silence ambiguous: the eagle
-        # drop is already folded into hit_length_by_group, and longest is a max
-        # over those post-drop values, so a run where *every* group is shortened
-        # equally has longest == hit and prints nothing -- which is exactly the
-        # hypothesis the log exists to test. ``max_len`` is the candidate the
-        # group was asked for and ``hit`` what it returned, so a uniform
-        # shortening is visible as every group losing the same amount.
-        # Only reconciliations that produced a hit. Every previous run spent its
-        # whole budget on wave-1 cold lookups, where every group returns 0 and
-        # the trace says nothing about which group decides a hit. Count the
-        # misses separately so their absence from the log is not read as their
-        # absence from the run.
+        # Spend the budget on collapses: a lookup where some group matched a
+        # real prefix and the reconciliation still ended at nothing. The
+        # previous filter (hit_length > 0) answered which group caps a hit and
+        # is now settled; it cannot see this case at all, and the two are
+        # mutually exclusive, so the question needs its own run.
+        #
+        # ``longest_hit_length > 0`` is what separates a collapse from a
+        # genuinely cold lookup. A request's own num_computed_tokens is 0 in
+        # both waves of the replay, so it cannot tell them apart -- but a wave-1
+        # lookup has nothing cached anywhere and every group returns 0, which
+        # drives longest to 0 as well. Count both other outcomes so silence in
+        # the log stays readable as "did not occur" rather than "not sampled".
         if hit_length == 0:
-            self._hit_reconcile_misses += 1
-            if self._hit_reconcile_misses in (1, 100, 1000):
-                logger.info(
-                    "Prefix hit reconciled to 0 (%d such so far)",
-                    self._hit_reconcile_misses,
-                )
+            if longest_hit_length > 0:
+                self._hit_reconcile_collapses += 1
+                if self._hit_reconcile_collapses in (100, 1000, 10000):
+                    # The rate matters as much as the shape: the traces below
+                    # are capped at 20, so without a running count a collapse
+                    # that explains half the requests and one that explains
+                    # 1% look identical in the log.
+                    logger.info(
+                        "Prefix hit collapsed to 0 despite a partial match "
+                        "(%d such so far; %d fully cold lookups)",
+                        self._hit_reconcile_collapses,
+                        self._hit_reconcile_misses,
+                    )
+            else:
+                self._hit_reconcile_misses += 1
+                if self._hit_reconcile_misses in (1, 100, 1000):
+                    logger.info(
+                        "Prefix lookup found nothing in any group (%d such so far)",
+                        self._hit_reconcile_misses,
+                    )
         if (
-            hit_length > 0
+            hit_length == 0
+            and longest_hit_length > 0
             and self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS
             and _trace
         ):
@@ -935,12 +977,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             # consistent with either the fine hash block or the coarse
             # scheduler block. Printing the two settles it without another arm.
             logger.info(
-                "Prefix hit reconciled to %d of %d tokens "
+                "Prefix hit collapsed to %d; best single group had %d of a %d "
+                "token ask "
                 "(eagle groups: %s, align=%d, partial_hash=%s, hash_block=%d, "
                 "sched_block=%d); per group "
-                "(idx, spec, block_size, max_len, hit, drop_eagle): %s",
+                "(idx, spec, block_size, max_len, hit, drop_eagle, unbounded): %s",
                 hit_length,
                 longest_hit_length,
+                max_cache_hit_length,
                 sorted(self.eagle_group_ids),
                 self._cache_hit_alignment_tokens,
                 self.enable_partial_hash_hits,
