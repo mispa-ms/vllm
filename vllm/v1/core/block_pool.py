@@ -191,6 +191,7 @@ class BlockPool:
         self.null_block.is_null = True
 
         self.enable_kv_cache_events = enable_kv_cache_events
+        self._masked_but_null = 0
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
@@ -273,6 +274,23 @@ class BlockPool:
             # like sliding window attention, or Mamba models with prefix-caching
             # in align mode. We skip null blocks here.
             if blk.is_null or (block_mask is not None and not block_mask[i]):
+                # Count the case the mask cannot express: it asked for this
+                # block to be kept, and by the time caching runs the block is
+                # already null. remove_skipped_blocks frees the previous Mamba
+                # state block inside the same allocate_slots call, 59 lines
+                # earlier (kv_cache_manager.py:507 against :566), and is_null is
+                # tested before the mask, so the retention policy and the free
+                # policy never meet. A non-zero count here is the whole
+                # explanation for a Mamba prefix hit that was marked, windowed,
+                # and still absent from the pool.
+                if blk.is_null and block_mask is not None and block_mask[i]:
+                    self._masked_but_null += 1
+                    if self._masked_but_null in (1, 100, 1000, 10000):
+                        logger.info(
+                            "cache_full_blocks skipped a block the mask asked "
+                            "to keep because it was already null (%d such)",
+                            self._masked_but_null,
+                        )
                 continue
             block_hash = new_block_hashes[i]
             num_hash_tokens = (num_cached_blocks + i + 1) * block_size
