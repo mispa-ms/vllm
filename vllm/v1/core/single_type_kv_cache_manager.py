@@ -498,6 +498,8 @@ class SingleTypeKVCacheManager(ABC):
                 self.block_size,
                 self.use_eagle,
                 block_mask,
+                self.req_to_blocks[request.request_id],
+                num_tokens,
             )
         self.block_pool.cache_full_blocks(
             request=request,
@@ -1860,7 +1862,20 @@ class _MambaTailTrace:
         block_size: int,
         use_eagle: bool,
         mask: list[bool] | None,
+        blocks: list[KVCacheBlock],
+        num_tokens: int,
     ) -> None:
+        """Whether a marked block is still a real block when caching runs.
+
+        ``cache_full_blocks`` skips a block that ``is_null`` *before* it looks at
+        the mask, and in align mode ``remove_skipped_blocks`` has already freed
+        the previous state block and put ``_null_block`` in its place -- in the
+        same ``allocate_slots`` call, 59 lines earlier. So marking a block is not
+        enough; it has to still hold a state at this moment. ``live`` is that
+        question, and ``chunk_aligned`` is the suspected reason it sometimes is
+        not: a step that ends off a Mamba block boundary carries the state past
+        the block the mask wants.
+        """
         cls._left -= 1
         marked = (
             "dense"
@@ -1868,14 +1883,23 @@ class _MambaTailTrace:
             else [i + start_block for i, m in enumerate(mask) if m]
         )
         want = [b // alignment * alignment // block_size - 1 for b in boundaries]
+        live = [
+            (i, not blocks[i].is_null)
+            for i in (want if mask is None else marked)
+            if 0 <= i < len(blocks)
+        ]
         logger.info(
             "Mamba mask: boundaries=%s -> want blocks %s | window [%d,%d) | "
-            "marked %s | eagle=%s",
+            "marked %s | live(idx,not_null) %s | num_tokens=%d "
+            "(%% block_size = %d) | eagle=%s",
             boundaries,
             want,
             start_block,
             end_block,
             marked,
+            live,
+            num_tokens,
+            num_tokens % block_size,
             use_eagle,
         )
 
