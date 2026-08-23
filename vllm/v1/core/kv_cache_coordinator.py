@@ -971,6 +971,45 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             and _trace
         ):
             self._hit_reconcile_logs += 1
+            # What is actually stored, rather than what the mask was asked to
+            # keep. Two earlier fixes were designed against a model of the store
+            # and both were wrong: adding a boundary at `tail - drop_unit` is
+            # erased by the mask's floor to `alignment_tokens`, and making the
+            # lookup fall back to a lower boundary cannot help because
+            # MambaManager's finder already scans every hash unit down to zero --
+            # a 0 means nothing is stored below the ceiling, not that something
+            # was out of reach.
+            #
+            # So probe the pool directly at the positions a Mamba state could
+            # exist: the chunk boundaries the scheduler actually ends on
+            # (max_num_batched_tokens floored to the Mamba block) and the
+            # prompt's last hash boundary. Whichever of those are absent is the
+            # store-side defect, stated rather than modelled.
+            for gid, group in enumerate(self.attention_groups):
+                if not isinstance(group.spec, MambaSpec):
+                    continue
+                mgr = self.single_type_managers[group.group_ids[0]]
+                bs = mgr.block_size
+                probes = []
+                pos = bs
+                while pos <= max_cache_hit_length:
+                    idx = pos // self.hash_block_size - 1
+                    if 0 <= idx < len(block_hashes):
+                        found = self.block_pool.get_cached_block(
+                            block_hashes[idx], group.group_ids
+                        )
+                        if found:
+                            probes.append(pos)
+                    pos += bs
+                logger.info(
+                    "Mamba store probe (group %d, block=%d): %d of %d block "
+                    "boundaries are in the pool%s",
+                    gid,
+                    bs,
+                    len(probes),
+                    max_cache_hit_length // bs,
+                    (" -> " + str(probes[-6:])) if probes else " (none)",
+                )
             # ``align`` and ``partial`` decide the granularity a hit can land
             # on, and they are the difference a length alone cannot show:
             # 122880 is both 960 x 128 and 10 x 12288, so the observed hit is
