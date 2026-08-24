@@ -511,6 +511,45 @@ class SingleTypeKVCacheManager(ABC):
             block_mask=block_mask,
         )
 
+        # Read back what was just written, for one request at a time.
+        #
+        # Every reading so far has stitched together evidence from different
+        # requests: the mask trace showed one request's block marked, live and
+        # in window, the store probe showed another request finding nothing, and
+        # "registered, then lost" was the join of the two. It was never observed
+        # on a single request. Insertion counts settled that the Mamba groups do
+        # insert (184 apiece, perfectly in lockstep across all fourteen), and
+        # the probe still returns 0 of 85 for the request it looks at, so some
+        # requests register and the collapsing ones do not -- which of the two
+        # this request is, only a readback on this request can say.
+        if isinstance(self.kv_cache_spec, MambaSpec) and _MambaTailTrace.want_rb(
+            request.request_id
+        ):
+            marked = (
+                list(range(num_cached_blocks, num_full_blocks))
+                if block_mask is None
+                else [i + num_cached_blocks for i, m in enumerate(block_mask) if m]
+            )
+            blocks = self.req_to_blocks[request.request_id]
+            hashes = resolve_block_hashes(
+                request.block_hashes, self.block_pool.hash_block_size, self.block_size
+            )
+            found = []
+            for b in marked:
+                if b < len(hashes) and self.block_pool.get_cached_block(
+                    hashes[b], [self.kv_cache_group_id]
+                ):
+                    found.append(b)
+            _MambaTailTrace.log_readback(
+                request.request_id,
+                self.kv_cache_group_id,
+                request.num_prompt_tokens,
+                num_tokens,
+                marked,
+                found,
+                [b for b in marked if b < len(blocks) and blocks[b].is_null],
+            )
+
         self.num_cached_block[request.request_id] = num_full_blocks
 
     @classmethod
@@ -1833,6 +1872,45 @@ class _MambaTailTrace:
     @classmethod
     def want(cls) -> bool:
         return cls._left > 0
+
+    _rb_left = 40
+    _rb_reqs: set = set()
+
+    @classmethod
+    def want_rb(cls, request_id: str) -> bool:
+        """Follow a few requests end to end rather than sampling many."""
+        if request_id in cls._rb_reqs:
+            return True
+        if len(cls._rb_reqs) < 3 and cls._rb_left > 0:
+            cls._rb_reqs.add(request_id)
+            return True
+        return False
+
+    @classmethod
+    def log_readback(
+        cls,
+        request_id: str,
+        group_id: int,
+        num_prompt: int,
+        num_tokens: int,
+        marked: list[int],
+        found: list[int],
+        null_marked: list[int],
+    ) -> None:
+        if cls._rb_left <= 0:
+            return
+        cls._rb_left -= 1
+        logger.info(
+            "Mamba readback req=%s group=%d prompt=%d computed=%d | marked %s "
+            "| in-pool right after the write %s | marked-but-null %s",
+            request_id[:12],
+            group_id,
+            num_prompt,
+            num_tokens,
+            marked,
+            found,
+            null_marked,
+        )
 
     @classmethod
     def interesting(
