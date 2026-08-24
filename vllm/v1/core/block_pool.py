@@ -194,6 +194,8 @@ class BlockPool:
         self._masked_but_null = 0
         self._evicted_total = 0
         self._evicted_per_group: dict[int, int] = {}
+        self._recache_total = 0
+        self._recache_dropped: dict[int, int] = {}
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
@@ -308,6 +310,29 @@ class BlockPool:
                     blk.block_hash_num_tokens is not None
                     and blk.block_hash_num_tokens < num_hash_tokens
                 )
+                # A block arriving here with a hash is supposed to be the same
+                # cache block being promoted from partial to full. The
+                # speculative recycle loop in MambaManager breaks that: it moves
+                # a physical block to a later index and nulls the slot it came
+                # from, so caching reaches it again at a new position while it
+                # still carries the hash of the state it held before. The assert
+                # above only checks that the token count grew, which moving
+                # forward always satisfies, so the old entry is dropped in
+                # silence -- no eviction involved, which is why a counter on
+                # _maybe_evict_cached_block stayed at zero.
+                self._recache_dropped[kv_cache_group_id] = (
+                    self._recache_dropped.get(kv_cache_group_id, 0) + 1
+                )
+                self._recache_total += 1
+                if self._recache_total in (1, 10, 100, 1000, 10000, 100000):
+                    logger.info(
+                        "Re-cached a block that still held a hash: %d so far, "
+                        "per group %s; this one %s -> %s tokens",
+                        self._recache_total,
+                        dict(sorted(self._recache_dropped.items())),
+                        blk.block_hash_num_tokens,
+                        num_hash_tokens,
+                    )
                 removed_hashes = self._remove_cached_block_hashes(blk)
                 self._emit_block_removed_events(removed_hashes)
             self._insert_block_hash(
