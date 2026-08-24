@@ -540,15 +540,26 @@ class SingleTypeKVCacheManager(ABC):
                     hashes[b], [self.kv_cache_group_id]
                 ):
                     found.append(b)
-            _MambaTailTrace.log_readback(
-                request.request_id,
-                self.kv_cache_group_id,
-                request.num_prompt_tokens,
-                num_tokens,
-                marked,
-                found,
-                [b for b in marked if b < len(blocks) and blocks[b].is_null],
+            # Spend the budget on the calls that decide something. Caching
+            # runs once per chunk, and the boundary block only enters the
+            # window near the end of the prompt -- the first attempt logged
+            # chunks 15,360 / 30,720 / 46,080, all with an empty mask, and ran
+            # out four chunks before the one that matters. Filtering on
+            # ordering rather than on the condition has now cost five traces;
+            # this filters on the condition.
+            near_tail = num_tokens + 2 * self.scheduler_block_size >= (
+                request.num_prompt_tokens
             )
+            if marked or near_tail:
+                _MambaTailTrace.log_readback(
+                    request.request_id,
+                    self.kv_cache_group_id,
+                    request.num_prompt_tokens,
+                    num_tokens,
+                    marked,
+                    found,
+                    [b for b in marked if b < len(blocks) and blocks[b].is_null],
+                )
 
         self.num_cached_block[request.request_id] = num_full_blocks
 
