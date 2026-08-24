@@ -198,6 +198,8 @@ class BlockPool:
         self._recache_dropped: dict[int, int] = {}
         self._partial_total = 0
         self._partial_dropped: dict[int, int] = {}
+        self._inserted_total = 0
+        self._inserted_per_group: dict[int, int] = {}
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
@@ -677,6 +679,35 @@ class BlockPool:
         block: KVCacheBlock,
         num_tokens: int | None,
     ) -> None:
+        """Registration itself, which has never been observed.
+
+        Every path that removes a cached hash has now been counted on the arm
+        that reproduces the collapse -- eviction, the re-cache in
+        cache_full_blocks, the partial-tail path, and the global reset -- and all
+        four are zero while the hit rate sits at 22.7%. If nothing removes the
+        entry, the remaining possibility is that it was never inserted. What was
+        measured before was only that the conditions which would *prevent*
+        insertion are clear: the block is marked, inside the window, live, and
+        the step ends on a block boundary.
+
+        So count insertions per group and name the token counts of the first few.
+        A Mamba group that never appears here is the answer; one that appears
+        with the expected boundary means the entry is lost somewhere outside all
+        five removal sites, and the pool's own structures are next.
+        """
+        _gid = int.from_bytes(bytes(block_hash_with_group_id)[-4:], "big")
+        self._inserted_per_group[_gid] = self._inserted_per_group.get(_gid, 0) + 1
+        self._inserted_total += 1
+        if self._inserted_total in (1, 100, 10000, 1000000):
+            logger.info(
+                "Prefix-cache insertions: %d total, per group %s; this one "
+                "group %d at %s tokens",
+                self._inserted_total,
+                dict(sorted(self._inserted_per_group.items())),
+                _gid,
+                num_tokens,
+            )
+
         if block.block_hash == block_hash_with_group_id:
             return
 
