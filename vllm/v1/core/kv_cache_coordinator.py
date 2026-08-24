@@ -155,6 +155,20 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
 
+        # Which kv-cache-group id holds which spec. Every group-level reading so
+        # far has inferred this from block sizes; print it once so it is read.
+        logger.info(
+            "KV cache groups: %s",
+            {
+                i: (
+                    type(g.kv_cache_spec).__name__,
+                    g.kv_cache_spec.block_size,
+                    len(g.layer_names),
+                )
+                for i, g in enumerate(kv_cache_config.kv_cache_groups)
+            },
+        )
+
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
         # 0 = keep only the latest replay boundary; None = dense;
@@ -990,17 +1004,38 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     continue
                 mgr = self.single_type_managers[group.group_ids[0]]
                 bs = mgr.block_size
+                # Per kv-cache-group, not all-or-nothing. get_cached_block
+                # returns a block only when *every* id in group_ids has the
+                # hash, so a probe that passes the whole list cannot say which
+                # one is missing -- and the insertion counts show they do not
+                # move together (1239/1239/1238/1238/1238/1162 at 10k total).
+                # Splitting it turns "nothing is stored" into "these groups have
+                # it and that one does not", which is the difference between a
+                # store that never ran and a store that ran unevenly.
                 probes = []
+                per_group: dict[int, int] = {gid_: 0 for gid_ in group.group_ids}
                 pos = bs
                 while pos <= max_cache_hit_length:
                     idx = pos // self.hash_block_size - 1
                     if 0 <= idx < len(block_hashes):
+                        for gid_ in group.group_ids:
+                            if self.block_pool.get_cached_block(
+                                block_hashes[idx], [gid_]
+                            ):
+                                per_group[gid_] += 1
                         found = self.block_pool.get_cached_block(
                             block_hashes[idx], group.group_ids
                         )
                         if found:
                             probes.append(pos)
                     pos += bs
+                logger.info(
+                    "Mamba store probe, per kv-cache-group: %s (of %d block "
+                    "boundaries); all-groups-together %d",
+                    dict(sorted(per_group.items())),
+                    max_cache_hit_length // bs,
+                    len(probes),
+                )
                 # ``gid`` indexes attention_groups, which merge kv cache groups,
                 # so it is not the id the insertion counter reports -- that one
                 # comes off the block hash key. Print the kv ids too, or the two

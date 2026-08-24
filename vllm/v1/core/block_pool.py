@@ -192,6 +192,7 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self._masked_but_null = 0
+        self._masked_but_null_per_group: dict[int, int] = {}
         self._evicted_total = 0
         self._evicted_per_group: dict[int, int] = {}
         self._recache_total = 0
@@ -293,11 +294,22 @@ class BlockPool:
                 # and still absent from the pool.
                 if blk.is_null and block_mask is not None and block_mask[i]:
                     self._masked_but_null += 1
+                    self._masked_but_null_per_group[kv_cache_group_id] = (
+                        self._masked_but_null_per_group.get(kv_cache_group_id, 0) + 1
+                    )
                     if self._masked_but_null in (1, 100, 1000, 10000):
+                        # Per group, because the insertion counter already names
+                        # which one is short -- one Mamba group behind its five
+                        # siblings, and get_cached_block needs all six. This skip
+                        # is the only step between "the mask asked to keep it"
+                        # and the insert, so a deficit that matches here is the
+                        # answer; one that does not moves the question earlier.
                         logger.info(
                             "cache_full_blocks skipped a block the mask asked "
-                            "to keep because it was already null (%d such)",
+                            "to keep because it was already null (%d such, "
+                            "per group %s)",
                             self._masked_but_null,
+                            dict(sorted(self._masked_but_null_per_group.items())),
                         )
                 continue
             block_hash = new_block_hashes[i]
