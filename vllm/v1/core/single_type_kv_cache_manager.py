@@ -559,6 +559,13 @@ class SingleTypeKVCacheManager(ABC):
                     marked,
                     found,
                     [b for b in marked if b < len(blocks) and blocks[b].is_null],
+                    # The key itself. Registration is now observed to work on a
+                    # single request -- block 79 marked, written and present one
+                    # line after the write -- and no removal path fires, yet a
+                    # later lookup finds nothing. The remaining possibility is
+                    # that the reader asks for a different key, so print the
+                    # bytes the writer used.
+                    [bytes(hashes[b])[:8].hex() for b in marked if b < len(hashes)],
                 )
 
         self.num_cached_block[request.request_id] = num_full_blocks
@@ -1907,13 +1914,14 @@ class _MambaTailTrace:
         marked: list[int],
         found: list[int],
         null_marked: list[int],
+        keys: list[str],
     ) -> None:
         if cls._rb_left <= 0:
             return
         cls._rb_left -= 1
         logger.info(
             "Mamba readback req=%s group=%d prompt=%d computed=%d | marked %s "
-            "| in-pool right after the write %s | marked-but-null %s",
+            "| in-pool right after the write %s | marked-but-null %s | keys %s",
             request_id[:12],
             group_id,
             num_prompt,
@@ -1921,6 +1929,7 @@ class _MambaTailTrace:
             marked,
             found,
             null_marked,
+            keys,
         )
 
     @classmethod

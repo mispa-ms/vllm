@@ -1029,12 +1029,24 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         if found:
                             probes.append(pos)
                     pos += bs
+                # The reader's key at the same position the writer logs, so
+                # the two can be compared directly rather than inferred equal.
+                # 122,880 is fine index 959; the writer prints the first eight
+                # bytes of the hash it registered for block 79.
+                probe_idx = 122880 // self.hash_block_size - 1
+                reader_key = (
+                    bytes(block_hashes[probe_idx])[:8].hex()
+                    if 0 <= probe_idx < len(block_hashes)
+                    else "out-of-range"
+                )
                 logger.info(
                     "Mamba store probe, per kv-cache-group: %s (of %d block "
-                    "boundaries); all-groups-together %d",
+                    "boundaries); all-groups-together %d; reader key at "
+                    "122,880 is %s",
                     dict(sorted(per_group.items())),
                     max_cache_hit_length // bs,
                     len(probes),
+                    reader_key,
                 )
                 # ``gid`` indexes attention_groups, which merge kv cache groups,
                 # so it is not the id the insertion counter reports -- that one
