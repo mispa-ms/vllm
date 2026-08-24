@@ -192,6 +192,8 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self._masked_but_null = 0
+        self._evicted_total = 0
+        self._evicted_per_group: dict[int, int] = {}
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
@@ -705,6 +707,33 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
+        # Per-group eviction counts. The collapse traces show a Mamba state
+        # block registered under the key the reader asks for, live and
+        # block-aligned at write time, and absent from the pool when a later
+        # request looks it up. Nothing in the mask, the window, the key or the
+        # chunk alignment explains that, which leaves reuse: align mode frees
+        # each state block as its request advances, and a freed cached block
+        # keeps its hash only until the pool recycles it. Counting evictions per
+        # group says whether that is what happens, and comparing the same number
+        # without speculation says why no-spec keeps its hits.
+        # A key is the block hash with the group id appended as four big-endian
+        # bytes (make_block_hash_with_group_id), so the group is the tail.
+        _keys = list(self.cached_block_hashes_by_block.get(block.block_id, ()))
+        if block.block_hash is not None:
+            _keys.append(block.block_hash)
+        for _key in _keys:
+            _gid = int.from_bytes(bytes(_key)[-4:], "big", signed=False)
+            self._evicted_per_group[_gid] = self._evicted_per_group.get(_gid, 0) + 1
+        if _keys:
+            self._evicted_total += 1
+            if self._evicted_total in (1, 1000, 10000, 100000, 1000000):
+                logger.info(
+                    "Prefix-cache blocks recycled out of the pool: %d total, "
+                    "per group %s",
+                    self._evicted_total,
+                    dict(sorted(self._evicted_per_group.items())),
+                )
+
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
