@@ -1001,10 +1001,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         if found:
                             probes.append(pos)
                     pos += bs
+                # ``gid`` indexes attention_groups, which merge kv cache groups,
+                # so it is not the id the insertion counter reports -- that one
+                # comes off the block hash key. Print the kv ids too, or the two
+                # logs name different groups by the same number. They also say
+                # whether get_cached_block was asked for more than one group: it
+                # returns None unless *every* id hits, so a multi-id group turns
+                # one absent entry into a probe that reads as empty.
                 logger.info(
-                    "Mamba store probe (group %d, block=%d): %d of %d block "
-                    "boundaries are in the pool%s",
+                    "Mamba store probe (attn group %d, kv groups %s, block=%d): "
+                    "%d of %d block boundaries are in the pool%s",
                     gid,
+                    list(group.group_ids),
                     bs,
                     len(probes),
                     max_cache_hit_length // bs,
