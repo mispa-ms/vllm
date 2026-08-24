@@ -196,6 +196,8 @@ class BlockPool:
         self._evicted_per_group: dict[int, int] = {}
         self._recache_total = 0
         self._recache_dropped: dict[int, int] = {}
+        self._partial_total = 0
+        self._partial_dropped: dict[int, int] = {}
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
@@ -548,6 +550,26 @@ class BlockPool:
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
         ):
+            # The other site that drops a live entry, and the one the mask
+            # cannot gate: _cache_partial_tail_block calls this from outside
+            # cache_full_blocks' loop, so it fires whatever retention is set to.
+            # That fits what the hit rates say -- dense removes the mask and
+            # should make the gated site (cache_full_blocks) fire *more*, yet
+            # dense raises the hit rate from 22.7% to 49.1%. A deletion channel
+            # that does not grow with dense is the better candidate.
+            self._partial_dropped[kv_cache_group_id] = (
+                self._partial_dropped.get(kv_cache_group_id, 0) + 1
+            )
+            self._partial_total += 1
+            if self._partial_total in (1, 10, 100, 1000, 10000, 100000):
+                logger.info(
+                    "Partial-tail cache dropped a live entry: %d so far, per "
+                    "group %s; this one %s -> %s tokens",
+                    self._partial_total,
+                    dict(sorted(self._partial_dropped.items())),
+                    block.block_hash_num_tokens,
+                    num_hash_blocks * self.hash_block_size,
+                )
             removed_hashes = self._remove_cached_block_hashes(block)
             self._emit_block_removed_events(removed_hashes)
         self._insert_block_hash(
@@ -856,6 +878,10 @@ class BlockPool:
         self.cached_block_hashes_by_block.clear()
 
         # Remove all hashes from all blocks.
+        # A global wipe empties every group at once, which is the shape of
+        # '0 of 85 boundaries in the pool'. Never confirmed to fire here; one
+        # line rules it in or out.
+        logger.info("reset_prefix_cache: wiping the whole prefix cache")
         for block in self.blocks:
             block.reset_hash()
 
