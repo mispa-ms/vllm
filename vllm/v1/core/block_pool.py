@@ -159,6 +159,10 @@ class BlockPool:
         metrics_collector: Optional metrics collector for tracking block residency.
     """
 
+    # How often a hash moved to a new block without its token count. The
+    # destination is then the state `cache_full_blocks` asserts against.
+    _moved_without_token_count = 0
+
     def __init__(
         self,
         num_gpu_blocks: int,
@@ -750,6 +754,23 @@ class BlockPool:
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
         num_tokens = src_block.block_hash_num_tokens
+        if num_tokens is None:
+            # The destination then takes a hash with no token count, and the
+            # next `cache_full_blocks` to reach it asserts on exactly that.
+            # Static reading could not produce this state: the only setter
+            # always receives a count, and every reset clears both fields. So
+            # say what the source looked like when it happened.
+            BlockPool._moved_without_token_count += 1
+            if BlockPool._moved_without_token_count in (1, 10, 100, 1000):
+                logger.info(
+                    "move_block_hashes #%d: source %d has no token count "
+                    "(primary hash %s, %d secondary) -> dest %d",
+                    BlockPool._moved_without_token_count,
+                    src_block.block_id,
+                    "set" if src_block.block_hash is not None else "none",
+                    len(self.cached_block_hashes_by_block.get(src_block.block_id, ())),
+                    dst_block.block_id,
+                )
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
