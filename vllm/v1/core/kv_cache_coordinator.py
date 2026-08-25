@@ -1042,14 +1042,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 logger.info(
                     "Mamba store probe, per kv-cache-group: %s (of %d block "
                     "boundaries); all-groups-together %d; reader key at "
-                    "122,880 is %s, prompt %s",
+                    "122,880 is %s, ask %d tokens",
                     dict(sorted(per_group.items())),
                     max_cache_hit_length // bs,
                     len(probes),
                     reader_key,
-                    # Same prompt identifier the writer prints, so a reader key
-                    # that differs from a writer key means something.
-                    bytes(block_hashes[0])[:8].hex() if block_hashes else "none",
+                    # No prompt tag on this side: find_longest_cache_hit is
+                    # given hashes, not the request, so the raw token ids are
+                    # not reachable here. The writer's tag is what pairs them,
+                    # and the reader is identified by its ask length instead.
+                    max_cache_hit_length,
                 )
                 # ``gid`` indexes attention_groups, which merge kv cache groups,
                 # so it is not the id the insertion counter reports -- that one

@@ -522,8 +522,16 @@ class SingleTypeKVCacheManager(ABC):
         # the probe still returns 0 of 85 for the request it looks at, so some
         # requests register and the collapsing ones do not -- which of the two
         # this request is, only a readback on this request can say.
-        if isinstance(self.kv_cache_spec, MambaSpec) and _MambaTailTrace.want_rb(
-            request.request_id
+        if (
+            isinstance(self.kv_cache_spec, MambaSpec)
+            # One group carries the answer. The fourteen Mamba ids were measured
+            # to move in lockstep -- 184 insertions and 7-8 null-skips apiece --
+            # so logging all of them spends the budget fourteen times over on
+            # identical lines. Latched rather than pinned to id 0: which ids are
+            # Mamba is a property of the model being served, and a hardcoded id
+            # silently traces nothing wherever the layout differs.
+            and _MambaTailTrace.owns_group(self.kv_cache_group_id)
+            and _MambaTailTrace.want_rb(request.request_id)
         ):
             marked = (
                 list(range(num_cached_blocks, num_full_blocks))
@@ -566,16 +574,13 @@ class SingleTypeKVCacheManager(ABC):
                     # that the reader asks for a different key, so print the
                     # bytes the writer used.
                     [bytes(hashes[b])[:8].hex() for b in marked if b < len(hashes)],
-                    # Identifies the prompt. The keys printed on the two sides
-                    # cannot be compared without it: three reader keys that
-                    # differ from the writer's mean nothing when the replay
-                    # carries sixteen distinct prompts and the samples may be
-                    # three of them. The hash of the first 128 tokens is the
-                    # same for the same prompt and different otherwise, so it
-                    # pairs a write with the read that should have matched it.
-                    bytes(request.block_hashes[0])[:8].hex()
-                    if request.block_hashes
-                    else "none",
+                    # Identifies the prompt, from raw token ids rather than a
+                    # hash. block_hashes[0] would be circular: it is produced by
+                    # the same hashing path under suspicion, and it is the one
+                    # block that mixes in extra keys (cache salt, multimodal),
+                    # so a difference there cannot separate "another prompt"
+                    # from "the hashing is inconsistent".
+                    _MambaTailTrace.prompt_tag(request),
                 )
 
         self.num_cached_block[request.request_id] = num_full_blocks
@@ -1901,15 +1906,35 @@ class _MambaTailTrace:
     def want(cls) -> bool:
         return cls._left > 0
 
-    _rb_left = 40
+    # Wide enough to catch the same prompt twice. The replay sends each prompt
+    # in a seed wave and again in a replay wave, and the decision needs both
+    # appearances of one prompt, not three requests seen once each. Only the
+    # tail chunk of each request logs, so the budget goes on decisions.
+    _rb_left = 400
     _rb_reqs: set = set()
+    _rb_cap = 40
+    _rb_group: int | None = None
+
+    @classmethod
+    def owns_group(cls, group_id: int) -> bool:
+        if cls._rb_group is None:
+            cls._rb_group = group_id
+        return cls._rb_group == group_id
+
+    @staticmethod
+    def prompt_tag(request) -> str:
+        """Length plus the first and last eight token ids, hashing untouched."""
+        ids = request.prompt_token_ids
+        if not ids:
+            return "none"
+        return f"{len(ids)}:{list(ids[:8])}:{list(ids[-8:])}"
 
     @classmethod
     def want_rb(cls, request_id: str) -> bool:
         """Follow a few requests end to end rather than sampling many."""
         if request_id in cls._rb_reqs:
             return True
-        if len(cls._rb_reqs) < 3 and cls._rb_left > 0:
+        if len(cls._rb_reqs) < cls._rb_cap and cls._rb_left > 0:
             cls._rb_reqs.add(request_id)
             return True
         return False
