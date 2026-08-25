@@ -1361,3 +1361,28 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
 
         prefill_worker.sender_loop = origin_sender_loop
         prefill_worker.shutdown()
+
+
+def test_pp_shards_do_not_block_a_shared_store():
+    """PP-disaggregated serving must not die on metadata this connector drops.
+
+    Producers and consumers meet in MooncakeDistributedStore, so this connector
+    never reads peer handshake metadata -- its inherited setter for it returns
+    None. The base PP-aware setter rejects `pp_rank > 0` to protect connectors
+    that do read it, and inheriting that rejection killed engine-core init on a
+    prefill-PP disaggregated arm (`received pp_rank > 0 handshake metadata but
+    does not support PP-disaggregated KV transfer`), over a value the connector
+    throws away.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import (
+        MooncakeStoreConnector,
+    )
+
+    pp_sharded = {(0, 0): None, (1, 0): None}
+
+    # Unbound so the test needs no store handle: the override is the contract.
+    MooncakeStoreConnector.set_xfer_handshake_metadata_pp_aware(object(), pp_sharded)
+
+    with pytest.raises(ValueError, match="does not support PP-disaggregated"):
+        KVConnectorBase_V1.set_xfer_handshake_metadata_pp_aware(object(), pp_sharded)
