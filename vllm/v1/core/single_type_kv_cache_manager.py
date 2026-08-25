@@ -433,6 +433,13 @@ class SingleTypeKVCacheManager(ABC):
             # than killing the engine, and count it: the rate decides whether
             # preserving the partial hit is worth a real fix.
             held = req_blocks[block_idx]
+            if not held.is_null:
+                # Overwriting the slot drops this request's reference to
+                # whatever sits there. The null block is shared and carries no
+                # per-request reference, but a real block would never come back
+                # to the pool -- the assertion this replaced at least made that
+                # loud.
+                self.block_pool.free_blocks([held])
             SingleTypeKVCacheManager._cow_slot_mismatches += 1
             if SingleTypeKVCacheManager._cow_slot_mismatches in (
                 1,
@@ -1545,6 +1552,12 @@ class MambaManager(SingleTypeKVCacheManager):
         ``reachable_boundaries`` are proven reuse points (the replay boundary and
         any cross-request shared-prefix junction, Marconi-style APC); their
         boundary state is always kept so sparse retention does not defeat reuse.
+
+        ``num_tokens`` is the chunk end this call is caching at, and it is what
+        names the one block holding a state. A caller that cannot supply it --
+        the mooncake store coordinator filters blocks it already holds, with no
+        chunk in hand -- gets dense, because an empty mask there would silently
+        stop the tier from keeping any mamba block at all.
         """
         if retention_interval is None or alignment_tokens is None:
             # Dense caching (default) or no alignment constraint imposed.
@@ -1564,7 +1577,13 @@ class MambaManager(SingleTypeKVCacheManager):
         # it as null. Measured on Kimi-K3: chunk ends ran ..., 115,200, 129,024,
         # 130,944, a 13,824-token step straight over the boundary that rounding
         # designated (122,880), and half the requests cached no full block.
-        if num_tokens is None or num_tokens % block_size:
+        if num_tokens is None:
+            # No chunk to name a block with: keep everything rather than
+            # nothing. Returning the empty mask here stopped the mooncake store
+            # coordinator, which filters blocks it already holds, from retaining
+            # any mamba block.
+            return None
+        if num_tokens % block_size:
             # A chunk ending mid-block leaves no full block holding a state.
             return mask
         state_block = end_block - 1

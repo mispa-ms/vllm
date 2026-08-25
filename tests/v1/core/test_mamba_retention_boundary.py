@@ -133,3 +133,35 @@ def test_retention_boundary_is_a_block_mamba_materialises() -> None:
         "later request sharing the prefix has only the partial tail to match, "
         "and the EAGLE drop puts that out of reach"
     )
+
+
+def test_a_caller_without_a_chunk_gets_dense() -> None:
+    """No chunk to name a block with must mean "keep everything", not "nothing".
+
+    `MooncakeStoreConnector`'s coordinator filters blocks it already holds, so
+    it calls the mask with no `num_tokens`. An empty mask there stops the tier
+    from retaining any mamba block at all -- silently, because nothing fails.
+    """
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    spec = MambaSpec(
+        block_size=MAMBA_BLOCK_SIZE,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    common = dict(
+        start_block=0,
+        end_block=16,
+        alignment_tokens=SCHEDULER_BLOCK_SIZE,
+        kv_cache_spec=spec,
+        use_eagle=True,
+        retention_interval=0,
+        reachable_boundaries=(131067,),
+    )
+
+    assert MambaManager.reachable_block_mask(**common) is None
+
+    # Given a chunk end, it keeps the block that chunk filled and only that one.
+    mask = MambaManager.reachable_block_mask(**common, num_tokens=16 * MAMBA_BLOCK_SIZE)
+    assert mask is not None and [i for i, v in enumerate(mask) if v] == [15]
