@@ -37,6 +37,10 @@ logger = init_logger(__name__)
 
 
 class SingleTypeKVCacheManager(ABC):
+    # How often the CoW slot was overwritten before the copy ran. The rate is
+    # what decides whether the partial hit is worth preserving properly.
+    _cow_slot_mismatches = 0
+
     """
     An abstract base class for a manager that handle the kv cache management
     logic of one specific type of attention layer.
@@ -418,7 +422,40 @@ class SingleTypeKVCacheManager(ABC):
         """
         req_blocks = self.req_to_blocks[request_id]
         assert block_idx < len(req_blocks)
-        assert req_blocks[block_idx] is source_block
+        if req_blocks[block_idx] is not source_block:
+            # The slot was overwritten between recording the partial hit and
+            # applying the copy -- `remove_skipped_blocks` substitutes the null
+            # block, and align mode's speculative reuse moves a block and nulls
+            # its old index. Neither invalidates `source_block` itself, which
+            # still holds the hit's tail state and is still referenced, so
+            # copying it into a private block and installing that at the index
+            # is what the request needs either way. Say so and carry on rather
+            # than killing the engine, and count it: the rate decides whether
+            # preserving the partial hit is worth a real fix.
+            held = req_blocks[block_idx]
+            SingleTypeKVCacheManager._cow_slot_mismatches += 1
+            if SingleTypeKVCacheManager._cow_slot_mismatches in (
+                1,
+                10,
+                100,
+                1000,
+                10000,
+            ):
+                logger.info(
+                    "CoW slot mismatch #%d: group=%d req=%s idx=%d of %d | slot "
+                    "holds %s (id=%s ref=%d) | source id=%s ref=%d | cached=%d",
+                    SingleTypeKVCacheManager._cow_slot_mismatches,
+                    self.kv_cache_group_id,
+                    request_id[:12],
+                    block_idx,
+                    len(req_blocks),
+                    "the null block" if held.is_null else "another block",
+                    held.block_id,
+                    held.ref_cnt,
+                    source_block.block_id,
+                    source_block.ref_cnt,
+                    self.num_cached_block.get(request_id, -1),
+                )
         assert not source_block.is_null and source_block.ref_cnt > 0
         req_blocks[block_idx] = cow_block
         self._pending_cow_copies.append((source_block, cow_block))
