@@ -29,7 +29,6 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 # Enough reconciliations to name the capping group without filling a log.
-_MAX_HIT_RECONCILE_LOGS = 20
 
 
 def _validate_prefix_cache_retention_interval(
@@ -107,9 +106,6 @@ class KVCacheCoordinator(ABC):
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
-        self._hit_reconcile_logs = 0
-        self._hit_reconcile_misses = 0
-        self._hit_reconcile_collapses = 0
         self.eagle_group_ids: set[int] = {
             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
         }
@@ -153,20 +149,6 @@ class KVCacheCoordinator(ABC):
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
-        )
-
-        # Which kv-cache-group id holds which spec. Every group-level reading so
-        # far has inferred this from block sizes; print it once so it is read.
-        logger.info(
-            "KV cache groups: %s",
-            {
-                i: (
-                    type(g.kv_cache_spec).__name__,
-                    g.kv_cache_spec.block_size,
-                    len(g.layer_names),
-                )
-                for i, g in enumerate(kv_cache_config.kv_cache_groups)
-            },
         )
 
         # A positive retention interval must be a multiple of the base hit granularity
@@ -802,7 +784,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
         longest_hit_length = 0
-        _trace: list[tuple] = []
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
         hit_length_by_group: list[int] = [0] * num_groups
 
@@ -875,44 +856,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 elif _new_hit_length < curr_hit_length:
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
-                if self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS:
-                    # A group that returns 0 has two very different causes:
-                    # its blocks are not in the pool at all, or they are and
-                    # the ceiling it was handed cannot reach them. The pair
-                    # (max_len, hit) cannot tell those apart, and the retention
-                    # mask cannot settle it either -- the mask marks which
-                    # blocks *may* be cached, while cache_full_blocks decides
-                    # which ones are. Re-ask the same finder without the eagle
-                    # drop and without the ceiling; ``unbounded`` is then the
-                    # group's own reach, so unbounded > 0 with hit == 0 means
-                    # the blocks are there and the ceiling is the cause.
-                    unbounded = None
-                    if _new_hit_length == 0 and curr_hit_length > 0:
-                        _, unbounded = manager_cls.find_longest_cache_hit(
-                            block_hashes=block_hashes,
-                            max_length=max_cache_hit_length,
-                            kv_cache_group_ids=group_ids,
-                            block_pool=self.block_pool,
-                            kv_cache_spec=spec,
-                            drop_eagle_block=False,
-                            alignment_tokens=self._cache_hit_alignment_tokens,
-                            dcp_world_size=(
-                                self.dcp_world_size
-                                if isinstance(spec, FullAttentionSpec)
-                                else 1
-                            ),
-                        )
-                    _trace.append(
-                        (
-                            idx,
-                            type(spec).__name__,
-                            self.single_type_managers[first_group_id].block_size,
-                            _max_length,
-                            _new_hit_length,
-                            drop_eagle_block,
-                            unbounded,
-                        )
-                    )
                 curr_hit_length = _new_hit_length
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
@@ -945,152 +888,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_blocks = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
-        # Spend the budget on collapses: a lookup where some group matched a
-        # real prefix and the reconciliation still ended at nothing. The
-        # previous filter (hit_length > 0) answered which group caps a hit and
-        # is now settled; it cannot see this case at all, and the two are
-        # mutually exclusive, so the question needs its own run.
-        #
-        # ``longest_hit_length > 0`` is what separates a collapse from a
-        # genuinely cold lookup. A request's own num_computed_tokens is 0 in
-        # both waves of the replay, so it cannot tell them apart -- but a wave-1
-        # lookup has nothing cached anywhere and every group returns 0, which
-        # drives longest to 0 as well. Count both other outcomes so silence in
-        # the log stays readable as "did not occur" rather than "not sampled".
-        if hit_length == 0:
-            if longest_hit_length > 0:
-                self._hit_reconcile_collapses += 1
-                if self._hit_reconcile_collapses in (100, 1000, 10000):
-                    # The rate matters as much as the shape: the traces below
-                    # are capped at 20, so without a running count a collapse
-                    # that explains half the requests and one that explains
-                    # 1% look identical in the log.
-                    logger.info(
-                        "Prefix hit collapsed to 0 despite a partial match "
-                        "(%d such so far; %d fully cold lookups)",
-                        self._hit_reconcile_collapses,
-                        self._hit_reconcile_misses,
-                    )
-            else:
-                self._hit_reconcile_misses += 1
-                if self._hit_reconcile_misses in (1, 100, 1000):
-                    logger.info(
-                        "Prefix lookup found nothing in any group (%d such so far)",
-                        self._hit_reconcile_misses,
-                    )
-        if (
-            hit_length == 0
-            and longest_hit_length > 0
-            and self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS
-            and _trace
-        ):
-            self._hit_reconcile_logs += 1
-            # What is actually stored, rather than what the mask was asked to
-            # keep. Two earlier fixes were designed against a model of the store
-            # and both were wrong: adding a boundary at `tail - drop_unit` is
-            # erased by the mask's floor to `alignment_tokens`, and making the
-            # lookup fall back to a lower boundary cannot help because
-            # MambaManager's finder already scans every hash unit down to zero --
-            # a 0 means nothing is stored below the ceiling, not that something
-            # was out of reach.
-            #
-            # So probe the pool directly at the positions a Mamba state could
-            # exist: the chunk boundaries the scheduler actually ends on
-            # (max_num_batched_tokens floored to the Mamba block) and the
-            # prompt's last hash boundary. Whichever of those are absent is the
-            # store-side defect, stated rather than modelled.
-            for gid, group in enumerate(self.attention_groups):
-                if not isinstance(group.spec, MambaSpec):
-                    continue
-                mgr = self.single_type_managers[group.group_ids[0]]
-                bs = mgr.block_size
-                # Per kv-cache-group, not all-or-nothing. get_cached_block
-                # returns a block only when *every* id in group_ids has the
-                # hash, so a probe that passes the whole list cannot say which
-                # one is missing -- and the insertion counts show they do not
-                # move together (1239/1239/1238/1238/1238/1162 at 10k total).
-                # Splitting it turns "nothing is stored" into "these groups have
-                # it and that one does not", which is the difference between a
-                # store that never ran and a store that ran unevenly.
-                probes = []
-                per_group: dict[int, int] = {gid_: 0 for gid_ in group.group_ids}
-                pos = bs
-                while pos <= max_cache_hit_length:
-                    idx = pos // self.hash_block_size - 1
-                    if 0 <= idx < len(block_hashes):
-                        for gid_ in group.group_ids:
-                            if self.block_pool.get_cached_block(
-                                block_hashes[idx], [gid_]
-                            ):
-                                per_group[gid_] += 1
-                        found = self.block_pool.get_cached_block(
-                            block_hashes[idx], group.group_ids
-                        )
-                        if found:
-                            probes.append(pos)
-                    pos += bs
-                # The reader's key at the same position the writer logs, so
-                # the two can be compared directly rather than inferred equal.
-                # 122,880 is fine index 959; the writer prints the first eight
-                # bytes of the hash it registered for block 79.
-                probe_idx = 122880 // self.hash_block_size - 1
-                reader_key = (
-                    bytes(block_hashes[probe_idx])[:8].hex()
-                    if 0 <= probe_idx < len(block_hashes)
-                    else "out-of-range"
-                )
-                logger.info(
-                    "Mamba store probe, per kv-cache-group: %s (of %d block "
-                    "boundaries); all-groups-together %d; reader key at "
-                    "122,880 is %s, ask %d tokens",
-                    dict(sorted(per_group.items())),
-                    max_cache_hit_length // bs,
-                    len(probes),
-                    reader_key,
-                    # No prompt tag on this side: find_longest_cache_hit is
-                    # given hashes, not the request, so the raw token ids are
-                    # not reachable here. The writer's tag is what pairs them,
-                    # and the reader is identified by its ask length instead.
-                    max_cache_hit_length,
-                )
-                # ``gid`` indexes attention_groups, which merge kv cache groups,
-                # so it is not the id the insertion counter reports -- that one
-                # comes off the block hash key. Print the kv ids too, or the two
-                # logs name different groups by the same number. They also say
-                # whether get_cached_block was asked for more than one group: it
-                # returns None unless *every* id hits, so a multi-id group turns
-                # one absent entry into a probe that reads as empty.
-                logger.info(
-                    "Mamba store probe (attn group %d, kv groups %s, block=%d): "
-                    "%d of %d block boundaries are in the pool%s",
-                    gid,
-                    list(group.group_ids),
-                    bs,
-                    len(probes),
-                    max_cache_hit_length // bs,
-                    (" -> " + str(probes[-6:])) if probes else " (none)",
-                )
-            # ``align`` and ``partial`` decide the granularity a hit can land
-            # on, and they are the difference a length alone cannot show:
-            # 122880 is both 960 x 128 and 10 x 12288, so the observed hit is
-            # consistent with either the fine hash block or the coarse
-            # scheduler block. Printing the two settles it without another arm.
-            logger.info(
-                "Prefix hit collapsed to %d; best single group had %d of a %d "
-                "token ask "
-                "(eagle groups: %s, align=%d, partial_hash=%s, hash_block=%d, "
-                "sched_block=%d); per group "
-                "(idx, spec, block_size, max_len, hit, drop_eagle, unbounded): %s",
-                hit_length,
-                longest_hit_length,
-                max_cache_hit_length,
-                sorted(self.eagle_group_ids),
-                self._cache_hit_alignment_tokens,
-                self.enable_partial_hash_hits,
-                self.hash_block_size,
-                self.scheduler_block_size,
-                _trace,
-            )
         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
 
     def find_longest_cache_hit_per_group(

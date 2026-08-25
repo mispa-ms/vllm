@@ -191,16 +191,10 @@ class BlockPool:
         self.null_block.is_null = True
 
         self.enable_kv_cache_events = enable_kv_cache_events
-        self._masked_but_null = 0
-        self._masked_but_null_per_group: dict[int, int] = {}
         self._evicted_total = 0
-        self._evicted_per_group: dict[int, int] = {}
         self._recache_total = 0
-        self._recache_dropped: dict[int, int] = {}
         self._partial_total = 0
-        self._partial_dropped: dict[int, int] = {}
         self._inserted_total = 0
-        self._inserted_per_group: dict[int, int] = {}
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
@@ -283,34 +277,6 @@ class BlockPool:
             # like sliding window attention, or Mamba models with prefix-caching
             # in align mode. We skip null blocks here.
             if blk.is_null or (block_mask is not None and not block_mask[i]):
-                # Count the case the mask cannot express: it asked for this
-                # block to be kept, and by the time caching runs the block is
-                # already null. remove_skipped_blocks frees the previous Mamba
-                # state block inside the same allocate_slots call, 59 lines
-                # earlier (kv_cache_manager.py:507 against :566), and is_null is
-                # tested before the mask, so the retention policy and the free
-                # policy never meet. A non-zero count here is the whole
-                # explanation for a Mamba prefix hit that was marked, windowed,
-                # and still absent from the pool.
-                if blk.is_null and block_mask is not None and block_mask[i]:
-                    self._masked_but_null += 1
-                    self._masked_but_null_per_group[kv_cache_group_id] = (
-                        self._masked_but_null_per_group.get(kv_cache_group_id, 0) + 1
-                    )
-                    if self._masked_but_null in (1, 100, 1000, 10000):
-                        # Per group, because the insertion counter already names
-                        # which one is short -- one Mamba group behind its five
-                        # siblings, and get_cached_block needs all six. This skip
-                        # is the only step between "the mask asked to keep it"
-                        # and the insert, so a deficit that matches here is the
-                        # answer; one that does not moves the question earlier.
-                        logger.info(
-                            "cache_full_blocks skipped a block the mask asked "
-                            "to keep because it was already null (%d such, "
-                            "per group %s)",
-                            self._masked_but_null,
-                            dict(sorted(self._masked_but_null_per_group.items())),
-                        )
                 continue
             block_hash = new_block_hashes[i]
             num_hash_tokens = (num_cached_blocks + i + 1) * block_size
@@ -326,29 +292,6 @@ class BlockPool:
                     blk.block_hash_num_tokens is not None
                     and blk.block_hash_num_tokens < num_hash_tokens
                 )
-                # A block arriving here with a hash is supposed to be the same
-                # cache block being promoted from partial to full. The
-                # speculative recycle loop in MambaManager breaks that: it moves
-                # a physical block to a later index and nulls the slot it came
-                # from, so caching reaches it again at a new position while it
-                # still carries the hash of the state it held before. The assert
-                # above only checks that the token count grew, which moving
-                # forward always satisfies, so the old entry is dropped in
-                # silence -- no eviction involved, which is why a counter on
-                # _maybe_evict_cached_block stayed at zero.
-                self._recache_dropped[kv_cache_group_id] = (
-                    self._recache_dropped.get(kv_cache_group_id, 0) + 1
-                )
-                self._recache_total += 1
-                if self._recache_total in (1, 10, 100, 1000, 10000, 100000):
-                    logger.info(
-                        "Re-cached a block that still held a hash: %d so far, "
-                        "per group %s; this one %s -> %s tokens",
-                        self._recache_total,
-                        dict(sorted(self._recache_dropped.items())),
-                        blk.block_hash_num_tokens,
-                        num_hash_tokens,
-                    )
                 removed_hashes = self._remove_cached_block_hashes(blk)
                 self._emit_block_removed_events(removed_hashes)
             self._insert_block_hash(
@@ -564,26 +507,6 @@ class BlockPool:
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
         ):
-            # The other site that drops a live entry, and the one the mask
-            # cannot gate: _cache_partial_tail_block calls this from outside
-            # cache_full_blocks' loop, so it fires whatever retention is set to.
-            # That fits what the hit rates say -- dense removes the mask and
-            # should make the gated site (cache_full_blocks) fire *more*, yet
-            # dense raises the hit rate from 22.7% to 49.1%. A deletion channel
-            # that does not grow with dense is the better candidate.
-            self._partial_dropped[kv_cache_group_id] = (
-                self._partial_dropped.get(kv_cache_group_id, 0) + 1
-            )
-            self._partial_total += 1
-            if self._partial_total in (1, 10, 100, 1000, 10000, 100000):
-                logger.info(
-                    "Partial-tail cache dropped a live entry: %d so far, per "
-                    "group %s; this one %s -> %s tokens",
-                    self._partial_total,
-                    dict(sorted(self._partial_dropped.items())),
-                    block.block_hash_num_tokens,
-                    num_hash_blocks * self.hash_block_size,
-                )
             removed_hashes = self._remove_cached_block_hashes(block)
             self._emit_block_removed_events(removed_hashes)
         self._insert_block_hash(
@@ -708,17 +631,6 @@ class BlockPool:
         five removal sites, and the pool's own structures are next.
         """
         _gid = int.from_bytes(bytes(block_hash_with_group_id)[-4:], "big")
-        self._inserted_per_group[_gid] = self._inserted_per_group.get(_gid, 0) + 1
-        self._inserted_total += 1
-        if self._inserted_total in (1, 100, 10000, 1000000):
-            logger.info(
-                "Prefix-cache insertions: %d total, per group %s; this one "
-                "group %d at %s tokens",
-                self._inserted_total,
-                dict(sorted(self._inserted_per_group.items())),
-                _gid,
-                num_tokens,
-            )
 
         if block.block_hash == block_hash_with_group_id:
             return
@@ -813,16 +725,6 @@ class BlockPool:
             _keys.append(block.block_hash)
         for _key in _keys:
             _gid = int.from_bytes(bytes(_key)[-4:], "big", signed=False)
-            self._evicted_per_group[_gid] = self._evicted_per_group.get(_gid, 0) + 1
-        if _keys:
-            self._evicted_total += 1
-            if self._evicted_total in (1, 1000, 10000, 100000, 1000000):
-                logger.info(
-                    "Prefix-cache blocks recycled out of the pool: %d total, "
-                    "per group %s",
-                    self._evicted_total,
-                    dict(sorted(self._evicted_per_group.items())),
-                )
 
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
@@ -924,7 +826,6 @@ class BlockPool:
         # A global wipe empties every group at once, which is the shape of
         # '0 of 85 boundaries in the pool'. Never confirmed to fire here; one
         # line rules it in or out.
-        logger.info("reset_prefix_cache: wiping the whole prefix cache")
         for block in self.blocks:
             block.reset_hash()
 
