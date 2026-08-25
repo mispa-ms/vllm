@@ -463,6 +463,7 @@ class SingleTypeKVCacheManager(ABC):
             use_eagle=self.use_eagle,
             retention_interval=retention_interval,
             reachable_boundaries=reachable_boundaries,
+            num_tokens=num_tokens,
         )
         # The output, not the input. Boundaries are identical across requests --
         # both arms log a single one at num_prompt-1 -- and each is floored to
@@ -595,6 +596,7 @@ class SingleTypeKVCacheManager(ABC):
         use_eagle: bool,
         retention_interval: int | None = None,
         reachable_boundaries: Sequence[int] = (),
+        num_tokens: int | None = None,
     ) -> list[bool] | None:
         """Per-block mask for ``cache_full_blocks``. ``None`` means cache
         every (non-null) block — the default for full attention.
@@ -1120,6 +1122,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         use_eagle: bool,
         retention_interval: int | None = None,
         reachable_boundaries: Sequence[int] = (),
+        num_tokens: int | None = None,
     ) -> list[bool] | None:
         assert isinstance(kv_cache_spec, SlidingWindowSpec)
         if alignment_tokens is None:
@@ -1492,6 +1495,7 @@ class MambaManager(SingleTypeKVCacheManager):
         use_eagle: bool,
         retention_interval: int | None = None,
         reachable_boundaries: Sequence[int] = (),
+        num_tokens: int | None = None,
     ) -> list[bool] | None:
         """Sparse Mamba state-snapshot retention.
 
@@ -1510,34 +1514,46 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         assert isinstance(kv_cache_spec, MambaSpec)
         block_size = kv_cache_spec.block_size
+        if retention_interval and retention_interval // block_size <= 1:
+            # Interval at/below the block size: every block is a boundary.
+            return None
         mask = [False] * (end_block - start_block)
 
-        # (1) Segment-boundary states. A Mamba hit needs exactly the single
-        # state block ending on the boundary (no window, and draft models have
-        # no mamba layers, so no eagle shift). Block ``i`` ends at token
-        # ``(i + 1) * block_size``.
-        segment_tokens = None if retention_interval == 0 else retention_interval
-        if segment_tokens is not None:
-            per_segment = segment_tokens // block_size
-            if per_segment <= 1:
-                # Interval at/below the block size: every block is a boundary.
-                return None
-            first_boundary = (
-                start_block + per_segment
-            ) // per_segment * per_segment - 1
-            for i in range(first_boundary - start_block, len(mask), per_segment):
-                mask[i] = True
+        # Keep the block this chunk filled, and only that one. Align mode
+        # materialises a state block solely at a chunk end -- earlier indices
+        # are the null placeholders the allocator left behind, later ones are
+        # speculative slots -- so naming a block by rounding a token count picks
+        # one that usually holds no state at all, and `cache_full_blocks` skips
+        # it as null. Measured on Kimi-K3: chunk ends ran ..., 115,200, 129,024,
+        # 130,944, a 13,824-token step straight over the boundary that rounding
+        # designated (122,880), and half the requests cached no full block.
+        if num_tokens is None or num_tokens % block_size:
+            # A chunk ending mid-block leaves no full block holding a state.
+            return mask
+        state_block = end_block - 1
+        if state_block < start_block:
+            return mask
 
-        # (2) Reachable-boundary states: the replay boundary (``num_prompt - 1``,
-        # capped by ``get_computed_blocks``) and any shared-prefix junction, both
-        # of which segments would otherwise skip under sparse retention. A Mamba
-        # hit needs exactly the single state block ending on the boundary.
-        for boundary_tokens in reachable_boundaries:
-            aligned = boundary_tokens // alignment_tokens * alignment_tokens
-            boundary_block = aligned // block_size - 1
-            if start_block <= boundary_block < end_block:
-                mask[boundary_block - start_block] = True
+        # Only up to a proven reuse point: the replay boundary
+        # (``num_prompt - 1``, capped by ``get_computed_blocks``) or a
+        # cross-request shared-prefix junction (Marconi-style APC).
+        last_token = num_tokens - 1
+        if not any(last_token <= boundary for boundary in reachable_boundaries):
+            return mask
 
+        # A positive interval thins those chunk ends to one per segment.
+        # ``start_block * block_size`` is what caching already covered, so
+        # comparing segment indices keeps the first chunk end entering a new
+        # segment without carrying state between calls.
+        if retention_interval:
+            cached_tokens = start_block * block_size
+            if cached_tokens and (
+                last_token // retention_interval
+                == (cached_tokens - 1) // retention_interval
+            ):
+                return mask
+
+        mask[state_block - start_block] = True
         return mask
 
     def remove_skipped_blocks(

@@ -4064,11 +4064,15 @@ def test_pure_swa_dense_retention_caches_all():
     assert cached == set(range(16))
 
 
-def test_mamba_reachable_block_mask_sparsifies_retention():
-    """Mamba state-snapshot retention: with a configured retention interval,
-    the manager keeps one cached state per interval-sized segment (plus the
-    latest replay boundary) instead of a snapshot per block, which is what
-    lets a small attention block_size avoid Mamba dominating the KV pool."""
+def test_mamba_reachable_block_mask_keeps_the_chunk_end():
+    """Sparse retention keeps the block the chunk filled, not a rounded one.
+
+    Align mode materialises a state block only at a chunk end: earlier indices
+    are null placeholders and later ones are speculative slots. A mask that
+    names a block by rounding a token count therefore asks to keep a block that
+    holds no state, and `cache_full_blocks` skips it -- which on Kimi-K3 left
+    half the requests with no cached full block at all.
+    """
     from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 
     block_size = 16
@@ -4079,73 +4083,81 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
         mamba_cache_mode="align",
     )
 
-    def retained(retention_interval, num_prompt_tokens=256, end_block=16):
+    def retained(retention_interval, num_tokens, start_block=0, boundaries=(255,)):
         m = MambaManager.reachable_block_mask(
-            start_block=0,
-            end_block=end_block,
-            alignment_tokens=block_size,
-            kv_cache_spec=spec,
-            use_eagle=False,
-            retention_interval=retention_interval,
-            reachable_boundaries=(num_prompt_tokens - 1,),
-        )
-        return None if m is None else {i for i, v in enumerate(m) if v}
-
-    # Dense retention (None) -> no mask, every block cached.
-    assert retained(None) is None
-    # interval == block_size -> every block is a boundary -> stays dense.
-    assert retained(block_size) is None
-    # interval 64 = 4 blocks: segment tails at i%4==3 -> {3,7,11,15}; latest
-    # replay boundary 240//16 - 1 = 14. Sparse subset of the 16 blocks.
-    assert retained(64) == {3, 7, 11, 14, 15}
-    # interval 0 -> only the latest replay boundary (block 14).
-    assert retained(0) == {14}
-
-
-def test_mamba_reachable_block_mask_pins_shared_prefix():
-    """A Marconi-detected shared prefix (``shared_prefix_boundary``) lands before
-    ``num_prompt`` so the replay-boundary rule alone would drop it. The mask must
-    pin the single state block ending on that boundary so sparse retention does
-    not defeat cross-request shared-prefix reuse."""
-    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-
-    block_size = 16
-    spec = MambaSpec(
-        block_size=block_size,
-        shapes=(1, 1),
-        dtypes=(torch.float32,),
-        mamba_cache_mode="align",
-    )
-
-    def retained(retention_interval, shared_prefix_boundary, end_block=16):
-        boundaries = [255]  # replay boundary (num_prompt 256 - 1)
-        if shared_prefix_boundary:
-            boundaries.append(shared_prefix_boundary)
-        m = MambaManager.reachable_block_mask(
-            start_block=0,
-            end_block=end_block,
+            start_block=start_block,
+            end_block=num_tokens // block_size,
             alignment_tokens=block_size,
             kv_cache_spec=spec,
             use_eagle=False,
             retention_interval=retention_interval,
             reachable_boundaries=boundaries,
+            num_tokens=num_tokens,
+        )
+        return None if m is None else {i + start_block for i, v in enumerate(m) if v}
+
+    # Dense retention (None) -> no mask, every block cached.
+    assert retained(None, 256) is None
+    # interval == block_size -> every block is a boundary -> stays dense.
+    assert retained(block_size, 256) is None
+
+    # A chunk ending on a block boundary keeps exactly that block, wherever the
+    # chunk happens to end -- no rounding, so no dependence on chunk size.
+    assert retained(0, 96) == {5}
+    assert retained(0, 112) == {6}
+    assert retained(0, 256) == {15}
+    # A chunk ending mid-block filled no block, so there is nothing to keep.
+    assert retained(0, 100) == set()
+    # Past every reachable boundary, the state is not a proven reuse point.
+    assert retained(0, 512, boundaries=(255,)) == set()
+
+    # A positive interval thins chunk ends to the first entering a new segment.
+    # start_block 4 means tokens 0..63 are already cached, so a chunk ending at
+    # 96 crosses into segment 1 and is kept.
+    assert retained(64, 96, start_block=4) == {5}
+    # A later chunk end inside that same segment is dropped.
+    assert retained(64, 112, start_block=6) == set()
+
+
+def test_mamba_reachable_block_mask_pins_shared_prefix():
+    """A Marconi-detected shared prefix extends how far chunk ends are kept.
+
+    ``shared_prefix_boundary`` lands before ``num_prompt``, so on its own the
+    replay-boundary rule would still cover it. It matters when it is the only
+    boundary: a chunk end at or below it is a proven reuse point and is kept,
+    one past it is not.
+    """
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    block_size = 16
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=(1, 1),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+
+    def retained(num_tokens, boundaries):
+        m = MambaManager.reachable_block_mask(
+            start_block=0,
+            end_block=num_tokens // block_size,
+            alignment_tokens=block_size,
+            kv_cache_spec=spec,
+            use_eagle=False,
+            retention_interval=0,
+            reachable_boundaries=boundaries,
+            num_tokens=num_tokens,
         )
         return None if m is None else {i for i, v in enumerate(m) if v}
 
-    # interval 0 keeps only replay boundary 14; the shared prefix at token 96
-    # (state block 96//16 - 1 = 5) is now pinned too.
-    assert retained(0, 96) == {5, 14}
-    # A non-aligned boundary floors to the enclosing aligned boundary.
-    assert retained(0, 100) == {5, 14}
-    # Coexists with segment tails (interval 64 -> {3,7,11,15} + replay 14).
-    assert retained(64, 96) == {3, 5, 7, 11, 14, 15}
-    # Dense retention ignores the hint (nothing to sparsify).
-    assert retained(None, 96) is None
-    # Out-of-range boundary is a no-op (only replay 14 remains).
-    assert retained(0, 16 * block_size * 2) == {14}
-    # No boundary given -> unchanged replay-only behavior.
-    assert retained(0, 0) == {14}
-    assert retained(0, None) == {14}
+    # The junction at token 96 keeps the chunk ending there.
+    assert retained(96, (96,)) == {5}
+    # And keeps an earlier chunk end too -- both are below it.
+    assert retained(64, (96,)) == {3}
+    # A chunk ending past the junction is not a proven reuse point.
+    assert retained(112, (96,)) == set()
+    # The replay boundary subsumes it when it is further out.
+    assert retained(112, (255, 96)) == {6}
 
 
 def test_mamba_shared_prefix_survives_zero_retention():
@@ -4160,7 +4172,7 @@ def test_mamba_shared_prefix_survives_zero_retention():
     # 16-block (256-token) prompt; replay boundary is block 240 // 16 - 1 = 14.
     token_ids = [i for i in range(16) for _ in range(block_size)]
 
-    def cached_mamba_blocks(shared_prefix_boundary):
+    def cached_mamba_blocks(shared_prefix_boundary, chunk_ends):
         # Fresh manager per scenario so cached blocks don't leak between runs.
         manager = make_kv_cache_manager(
             _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba"]),
@@ -4172,10 +4184,13 @@ def test_mamba_shared_prefix_survives_zero_retention():
         req = make_request("r", token_ids, block_size, sha256)
         req.shared_prefix_boundary = shared_prefix_boundary
         computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
-        blocks = manager.allocate_slots(
-            req, len(token_ids), num_computed, computed_blocks
-        )
-        assert blocks is not None
+        for end in chunk_ends:
+            blocks = manager.allocate_slots(
+                req, end - req.num_computed_tokens, num_computed, computed_blocks
+            )
+            assert blocks is not None
+            req.num_computed_tokens = end
+            computed_blocks, num_computed = manager.create_kv_cache_blocks(()), 0
         pool = manager.block_pool
         return {
             i
@@ -4184,11 +4199,14 @@ def test_mamba_shared_prefix_survives_zero_retention():
             is not None
         }
 
-    # Without a pinned boundary, retention=0 keeps only the replay boundary (14).
-    assert cached_mamba_blocks(0) == {14}
-    # Pinning the shared prefix at token 96 (state block 5) retains it too, so a
-    # later request sharing that prefix can hit the Mamba state.
-    assert cached_mamba_blocks(96) == {5, 14}
+    # One chunk over the whole prompt: the only state is the one it filled, at
+    # the end. The junction at token 96 has no state because no chunk ended
+    # there -- pinning it cannot conjure one.
+    assert cached_mamba_blocks(0, [256]) == {15}
+    assert cached_mamba_blocks(96, [256]) == {15}
+    # Chunking so a chunk does end on the junction gives it a state block (5),
+    # which a later request sharing that prefix can hit.
+    assert cached_mamba_blocks(96, [96, 256]) == {5, 15}
 
 
 def test_mamba_shared_prefix_reuse_under_zero_retention():
@@ -4199,7 +4217,7 @@ def test_mamba_shared_prefix_reuse_under_zero_retention():
     is preserved."""
     block_size = 16
 
-    def last_req_hit(retention, pin):
+    def last_req_hit(retention, pin, stop_at_junction=True):
         manager = make_kv_cache_manager(
             _make_hybrid_kv_cache_config(block_size, 200, ["full", "mamba_align"]),
             max_model_len=8192,
@@ -4225,8 +4243,10 @@ def test_mamba_shared_prefix_reuse_under_zero_retention():
         assert boundary == 2 * block_size  # junction detected at 2 shared blocks
         if pin:
             req1.shared_prefix_boundary = boundary
-        # Simulate the Marconi chunk: schedule up to the junction (boundary - nc).
-        manager.allocate_slots(req1, boundary - nc, nc, cb)
+        # The Marconi chunk schedules up to the junction, so a chunk ends
+        # exactly there; `stop_at_junction=False` runs straight past it instead.
+        num_new = boundary - nc if stop_at_junction else len(req1.all_token_ids) - nc
+        manager.allocate_slots(req1, num_new, nc, cb)
 
         # req2 shares the same prefix: does it reuse the cached junction?
         req2 = make_request("2", shared + distinct(70), block_size, sha256)
@@ -4235,10 +4255,14 @@ def test_mamba_shared_prefix_reuse_under_zero_retention():
 
     # Dense retains the junction -> reuse works (baseline ceiling).
     assert last_req_hit(retention=None, pin=False) == 2 * block_size
-    # retention=0 without the pin masks the junction out -> reuse lost (the bug).
-    assert last_req_hit(retention=0, pin=False) == 0
-    # retention=0 with the pin keeps the junction -> reuse restored.
+    # The Marconi chunk ends on the junction, so that state block exists and
+    # retention=0 keeps it -- with or without the pin.
+    assert last_req_hit(retention=0, pin=False) == 2 * block_size
     assert last_req_hit(retention=0, pin=True) == 2 * block_size
+    # Run past the junction in one chunk and no state block ends there, so
+    # there is nothing to keep and nothing to reuse. The pin cannot change that:
+    # it names a block align mode never materialised.
+    assert last_req_hit(retention=0, pin=True, stop_at_junction=False) == 0
 
 
 def test_swa_reachable_block_mask_pins_shared_prefix():
