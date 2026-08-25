@@ -1042,11 +1042,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 logger.info(
                     "Mamba store probe, per kv-cache-group: %s (of %d block "
                     "boundaries); all-groups-together %d; reader key at "
-                    "122,880 is %s",
+                    "122,880 is %s, prompt %s",
                     dict(sorted(per_group.items())),
                     max_cache_hit_length // bs,
                     len(probes),
                     reader_key,
+                    # Same prompt identifier the writer prints, so a reader key
+                    # that differs from a writer key means something.
+                    bytes(block_hashes[0])[:8].hex() if block_hashes else "none",
                 )
                 # ``gid`` indexes attention_groups, which merge kv cache groups,
                 # so it is not the id the insertion counter reports -- that one

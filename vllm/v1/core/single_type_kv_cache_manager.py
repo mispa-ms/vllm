@@ -566,6 +566,16 @@ class SingleTypeKVCacheManager(ABC):
                     # that the reader asks for a different key, so print the
                     # bytes the writer used.
                     [bytes(hashes[b])[:8].hex() for b in marked if b < len(hashes)],
+                    # Identifies the prompt. The keys printed on the two sides
+                    # cannot be compared without it: three reader keys that
+                    # differ from the writer's mean nothing when the replay
+                    # carries sixteen distinct prompts and the samples may be
+                    # three of them. The hash of the first 128 tokens is the
+                    # same for the same prompt and different otherwise, so it
+                    # pairs a write with the read that should have matched it.
+                    bytes(request.block_hashes[0])[:8].hex()
+                    if request.block_hashes
+                    else "none",
                 )
 
         self.num_cached_block[request.request_id] = num_full_blocks
@@ -1915,13 +1925,15 @@ class _MambaTailTrace:
         found: list[int],
         null_marked: list[int],
         keys: list[str],
+        prompt_key: str,
     ) -> None:
         if cls._rb_left <= 0:
             return
         cls._rb_left -= 1
         logger.info(
             "Mamba readback req=%s group=%d prompt=%d computed=%d | marked %s "
-            "| in-pool right after the write %s | marked-but-null %s | keys %s",
+            "| in-pool right after the write %s | marked-but-null %s | keys %s "
+            "| prompt %s",
             request_id[:12],
             group_id,
             num_prompt,
@@ -1930,6 +1942,7 @@ class _MambaTailTrace:
             found,
             null_marked,
             keys,
+            prompt_key,
         )
 
     @classmethod
