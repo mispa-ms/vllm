@@ -21,6 +21,35 @@
 # Building upstream main with these also restores what the vendor Rubin image
 # lacks: main's K3 plugin carries the DCP implementation and no assert against
 # it, where the rubin-branch plugin has the assert and none of the code.
+#
+# ── EVERY PIN BELOW WAS RESOLVED AGAINST ITS INDEX, 2026-08-27 ───────────────
+# Recorded so nobody re-derives this. Each was queried through the GitLab PyPI
+# simple API / urm and found:
+#
+#   torch 2.14.0a0+4fdf77b940.nvinternal.rubin.0.8dev.63567690   present (9703)
+#     9703 also serves .63530037 and .63969804 of the same base, plus a
+#     separate nv26.8.* line. Reading only the first entry the index returns
+#     makes it look as though the pinned build is missing; it is not.
+#   flashinfer-python / -jit-cache / -cubin
+#     0.6.18+a6ab7e1e.nvinternal.rubin.0.8dev.devel.cu.63806613  all three
+#     present (179191). -cubin is the one expected to carry the SM107
+#     batched_gemm kernels that moe-backend auto currently 404s on.
+#   cuda-python / cuda-bindings 13.4.2.dev2+g98f534ba            present (445717)
+#   nvidia-cutlass-dsl==4.8.0a0                                  present (urm)
+#     urm serves it only as 4.8.0a0+<date>.<sha>. That still satisfies the
+#     specifier: PEP 440 ignores the local version for ==, checked with
+#     packaging.specifiers rather than assumed.
+#   the four CUDA base images (dl/dgx/cuda 13.4 and 13.5 rubin, manylinux and
+#     ubuntu24.04, arm64)                                        all present
+#
+# NOT verified: the Triton revision in the build command
+# (3f6e41132b5edf639bfb872ad73d4688765e08b8) -- GitHub rate-limited the check.
+#
+# What is NOT ready is on the AIB side, not here: ci/base/docker.yml lost
+# .build_base_container and .build_push_final_container to 16c3d942 ("Remove
+# BTK 1.0 support from AIB", 2026-07-28), and main's vLLM cu13 build jobs are
+# exit-1 stubs for both x86 and aarch64. Restoring that scaffolding is what
+# stands between this file and an image.
 
 --extra-index-url https://gitlab-master.nvidia.com/api/v4/projects/9703/packages/pypi/simple
 --extra-index-url https://gitlab-master.nvidia.com/api/v4/projects/179191/packages/pypi/simple
