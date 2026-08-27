@@ -1,0 +1,42 @@
+# Rubin (VR200 / sm_107) pre-release dependencies.
+#
+# Consumed by docker/Dockerfile when INSTALL_RUBIN_PRERELEASE=true, added in
+# vllm-project/vllm#53443. Contents are Shang Wang's, posted to #swdl-vllm-dev
+# on 2026-08-27; they are the not-yet-released halves of the Rubin stack, and
+# each is expected to be replaced by a public wheel as it ships.
+#
+# Why this file is what unblocks Kimi-K3 on Hecate, concretely. Every wall that
+# track hit is one of these lines:
+#
+#   nvidia-cutlass-dsl 4.8   the CuteDSL that knows sm_107a. Without it, K3's
+#                            latent-MoE tail fusion dies in cute.compile with
+#                            KeyError: 'sm_107a'.
+#   flashinfer-* nvinternal  the build carrying the SM107 cubins. Without them
+#                            moe-backend auto fetches batched_gemm-fe08bc1 and
+#                            gets a 404, so the engine never starts.
+#   the CUDA 13.4/13.5 base  ptxas that has an sm_107 target at all. 13.0.88
+#                            (upstream nightly) and 13.3.73 both lack it, so
+#                            every Triton JIT fails after the weights load.
+#
+# Building upstream main with these also restores what the vendor Rubin image
+# lacks: main's K3 plugin carries the DCP implementation and no assert against
+# it, where the rubin-branch plugin has the assert and none of the code.
+
+--extra-index-url https://gitlab-master.nvidia.com/api/v4/projects/9703/packages/pypi/simple
+--extra-index-url https://gitlab-master.nvidia.com/api/v4/projects/179191/packages/pypi/simple
+--extra-index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
+--extra-index-url https://gitlab-master.nvidia.com/api/v4/projects/445717/packages/pypi/simple
+
+cuda-python==13.4.2.dev2+g98f534ba ; python_version == "3.12" and sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64")
+cuda-bindings==13.4.2.dev2+g98f534ba ; python_version == "3.12" and sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64")
+
+torch==2.14.0a0+4fdf77b940.nvinternal.rubin.0.8dev.63567690    # internal PyTorch build with the uGPU localization APIs
+torchvision==0.29.0a0+0bc41e67.nvinternal.rubin.0.8dev.63567690
+mkl==2021.1.1; platform_machine == "x86_64"
+nvpl-blas==0.5.0.1; platform_machine == "aarch64"
+nvpl-lapack==0.3.2; platform_machine == "aarch64"
+nvidia-cutlass-dsl[cu13]==4.8.0a0                              # unreleased CuteDSL 4.8
+flashinfer-python==0.6.18+a6ab7e1e.nvinternal.rubin.0.8dev.devel.cu.63806613
+flashinfer-jit-cache==0.6.18+a6ab7e1e.nvinternal.rubin.0.8dev.devel.cu.63806613
+flashinfer-cubin==0.6.18+a6ab7e1e.nvinternal.rubin.0.8dev.devel.cu.63806613    # internal FI build with the unreleased cubins
+nixl==1.4.0                                                    # public, already released
