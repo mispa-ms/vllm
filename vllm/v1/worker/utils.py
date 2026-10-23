@@ -906,26 +906,85 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 layer.impl._v_scale_cache = None
 
 
+def _scheduler_block_extent(
+    cache: torch.Tensor, num_blocks: int
+) -> tuple[int, int, bool] | None:
+    """Return the byte stride and byte span of one scheduler block of
+    ``cache`` and whether its elements fill that span, or None if dim 0 does
+    not count whole scheduler blocks."""
+    kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
+    if remainder or kernel_blocks_per_block == 0:
+        return None
+    block = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))[0]
+    last_element = sum(
+        (size - 1) * stride for size, stride in zip(block.shape, block.stride())
+    )
+    element_size = cache.element_size()
+    stride = cache.stride(0) * element_size * kernel_blocks_per_block
+    return stride, (last_element + 1) * element_size, block.is_contiguous()
+
+
+def _page_views_to_copy(
+    views: list[torch.Tensor], num_blocks: int
+) -> list[torch.Tensor]:
+    """Select the views whose block copies cover every page at one address.
+
+    ``views`` are the distinct views starting at one address, first-seen
+    first. KV cache groups overlay their pages, so in a hybrid model a Mamba
+    state view and an attention view can start at the same address while the
+    first one covers only the start of the longer page. A view is a page at
+    this address if it indexes scheduler blocks with the first view's block
+    stride; other views (e.g. a raw backing tensor) are not copied. A dense
+    widest page covers all the others and is copied alone; otherwise every
+    page view is copied.
+    """
+    if len(views) == 1:
+        return views
+    first = _scheduler_block_extent(views[0], num_blocks)
+    assert first is not None
+    pages = [(views[0], first)]
+    for view in views[1:]:
+        extent = _scheduler_block_extent(view, num_blocks)
+        if extent is not None and extent[0] == first[0]:
+            pages.append((view, extent))
+    # Widest span first; among equal spans prefer a dense view.
+    widest, (_, _, dense) = max(pages, key=lambda page: page[1][1:])
+    return [widest] if dense else [view for view, _ in pages]
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
 ) -> None:
+    """Copy scheduler blocks ``src -> dst`` in place in every KV cache.
+
+    Used for the copy-on-write of partial prefix-cache hits. Pages that
+    several KV cache groups overlay are copied in full.
+    """
     if not kv_cache_block_copies:
         return
 
+    # Group the views by base address, in first-seen order. data_ptr
+    # distinguishes per-layer views of a shared allocation. Layers sharing KV
+    # (cross-layer sharing) alias the same view; keep one view per layout.
+    # Empty views have nothing to copy.
+    views_by_address: dict[
+        tuple[torch.device, int],
+        dict[tuple[torch.dtype, torch.Size, tuple[int, ...]], torch.Tensor],
+    ] = {}
+    for cache in kv_caches:
+        if cache.numel() == 0:
+            continue
+        layouts = views_by_address.setdefault((cache.device, cache.data_ptr()), {})
+        layouts.setdefault((cache.dtype, cache.shape, cache.stride()), cache)
+
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
     indices: torch.Tensor | None = None
-    seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
-    for cache in kv_caches:
-        # Layers sharing KV (cross-layer sharing) alias the same view; copy it
-        # once. data_ptr distinguishes per-layer views of a shared allocation.
-        key = (cache.device, cache.data_ptr())
-        if key in seen:
-            continue
-        seen.add(key)
-
+    for layouts in views_by_address.values():
+        views = list(layouts.values())
+        cache = views[0]
         if indices is None:
             indices = async_tensor_h2d(indices_np, device=cache.device)
         assert cache.device == indices.device
@@ -947,12 +1006,19 @@ def copy_kv_cache_blocks_inplace(
             copied_storages.add(storage_key)
             blocks = torch.empty(0, dtype=torch.uint8, device=cache.device)
             blocks.set_(storage)
-            blocks = blocks.view(num_blocks, -1)
+            page_views = [blocks.view(num_blocks, -1)]
         else:
             # Fold virtual block splitting into the shape so that dim 0 counts
             # scheduler blocks; unflatten of dim 0 is always a view.
-            blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
-        blocks[dst] = blocks[src]
+            page_views = [
+                view.unflatten(0, (num_blocks, -1))
+                for view in _page_views_to_copy(views, num_blocks)
+            ]
+        # Read every source before writing any destination, so that page views
+        # which overlap copy the same bytes as a single copy would.
+        sources = [blocks[src] for blocks in page_views]
+        for blocks, source in zip(page_views, sources):
+            blocks[dst] = source
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
