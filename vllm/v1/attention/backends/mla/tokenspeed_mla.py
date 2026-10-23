@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -71,6 +72,40 @@ def _get_workspace(
             "TokenSpeed MLA decode workspace: %.2f GiB", needed / (1 << 30)
         )
     return current_workspace_manager().get_simultaneous(((needed,), torch.int8))[0]
+
+
+def _check_fp16_partials_supported() -> None:
+    from tokenspeed_mla import mla_decode
+
+    if not hasattr(mla_decode, "_FP16_PARTIALS"):
+        raise NotImplementedError(
+            "VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS needs a tokenspeed_mla "
+            "release that selects fp16 split-KV partials through "
+            "tokenspeed_mla.mla_decode._FP16_PARTIALS."
+        )
+    if mla_decode._FP16_PARTIALS:
+        raise ValueError(
+            "VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS keeps draft-model layers on "
+            "fp32 split-KV partials, but TOKENSPEED_MLA_FP16_PARTIALS=1 already "
+            "enables fp16 partials for every layer. Unset one of them."
+        )
+
+
+def _tokenspeed_mla_decode_fp16_partials(**kwargs):
+    """``tokenspeed_mla_decode`` with fp16 split-KV partial outputs.
+
+    tokenspeed_mla selects the partial dtype with a module-level switch that
+    ``tokenspeed_mla_decode`` reads at call time (part of its kernel cache
+    key), so the switch is set for the duration of this call only.
+    """
+    from tokenspeed_mla import mla_decode
+
+    previous = mla_decode._FP16_PARTIALS
+    mla_decode._FP16_PARTIALS = True
+    try:
+        return mla_decode.tokenspeed_mla_decode(**kwargs)
+    finally:
+        mla_decode._FP16_PARTIALS = previous
 
 
 class TokenspeedMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
@@ -178,6 +213,9 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
     # tokenspeed_mla_decode returns LSE in log2 units; its own DCP test merges
     # partial outputs with exp2(lse).
     lse_base_on_e: bool = False
+    # VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS: fp16 split-KV partials on
+    # target-model layers (draft-model layers keep fp32).
+    fp16_partials_for_target: bool = False
 
     def __init__(
         self,
@@ -243,6 +281,14 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 ),
                 config.compilation_config.max_cudagraph_capture_size or 0,
             )
+
+        if envs.VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS:
+            _check_fp16_partials_supported()
+            logger.info_once(
+                "TokenSpeed MLA decode uses fp16 split-KV partials on target-model "
+                "layers (VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS)."
+            )
+            self.fp16_partials_for_target = True
 
         self.softmax_scale: float | None = None
         self.output_scale: float | None = None
@@ -329,7 +375,13 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # vLLM kv_c_and_k_pe_cache is already (num_blocks, block_size, head_size).
         # tokenspeed_mla_decode wants 3D — pass as-is (no unsqueeze, unlike trtllm).
         return_lse = self.need_to_return_lse_for_decode
-        kernel_out = tokenspeed_mla_decode(
+        decode = tokenspeed_mla_decode
+        # The speculator marks draft-model layers once the drafter is loaded.
+        if self.fp16_partials_for_target and not getattr(
+            layer, "is_draft_layer", False
+        ):
+            decode = _tokenspeed_mla_decode_fp16_partials
+        kernel_out = decode(
             query=q,
             kv_cache=kv_c_and_k_pe_cache,
             workspace_buffer=workspace,

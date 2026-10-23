@@ -205,6 +205,7 @@ if TYPE_CHECKING:
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
     VLLM_USE_TRITON_DIRECT_DCP_A2A: bool = False
+    VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -2249,6 +2250,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of the CUDA op. Same protocol and bit-identical output.
     "VLLM_USE_TRITON_DIRECT_DCP_A2A": lambda: bool(
         int(os.getenv("VLLM_USE_TRITON_DIRECT_DCP_A2A", "0"))
+    ),
+    # TokenSpeed MLA decode: keep the split-KV partial outputs of target-model
+    # layers in fp16 instead of fp32 (draft-model layers stay fp32). Lowers
+    # precision; opt-in.
+    "VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS": lambda: bool(
+        int(os.getenv("VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS", "0"))
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
