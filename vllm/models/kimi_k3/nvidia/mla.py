@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
@@ -86,6 +87,11 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_kv_concat_quant_fp8,
     fused_mla_qkv_quant_kv_cache_fp8_insert,
 )
+from vllm.models.kimi_k3.nvidia.ops.mla_wuv_projection import (
+    fits_fp16_exchange,
+    mla_wuv_projection,
+    wuv_projection_bound,
+)
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
@@ -99,7 +105,12 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
-from vllm.v1.attention.ops.dcp import MLADCPManager
+from vllm.v1.attention.ops.dcp import (
+    DirectDCPA2AWorkspace,
+    MLADCPManager,
+    dcp_a2a_lse_reduce,
+    get_direct_dcp_a2a_workspace,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, get_kv_quant_mode
@@ -388,6 +399,14 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 is_lse_base_on_e=self.impl.lse_base_on_e,
                 use_pcp=False,
             )
+        # VLLM_KIMI_K3_MLA_WUV_BEFORE_DCP_COMBINE; the weights are prepared in
+        # process_weights_after_loading.
+        self._wuv_before_dcp_combine = (
+            envs.VLLM_KIMI_K3_MLA_WUV_BEFORE_DCP_COMBINE
+            and self._check_wuv_before_dcp_combine(vllm_config)
+        )
+        self._dcp_wuv: torch.Tensor | None = None
+        self._dcp_wuv_workspace: DirectDCPA2AWorkspace | None = None
         self.prefill_backend = get_mla_prefill_backend(vllm_config)(
             num_heads=self.num_local_heads,
             scale=self.scale,
@@ -474,6 +493,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.register_buffer(
             "_k_scale_inv", self._k_scale.reciprocal().reshape(1), persistent=False
         )
+        if self._wuv_before_dcp_combine:
+            self._init_wuv_before_dcp_combine(act_dtype)
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor) -> None:
         """Project latent attention output back to ``v`` via ``W_UV`` (bmm)."""
@@ -482,6 +503,140 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         out = out.view(-1, self.num_local_heads, self.v_head_dim)
         # (N, B, L) x (N, L, V) -> (N, B, V) written transposed into (B, N, V)
         torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+
+    # ------------------------------------------------------------------
+    # W_UV before the DCP combine (VLLM_KIMI_K3_MLA_WUV_BEFORE_DCP_COMBINE)
+    # ------------------------------------------------------------------
+    # The decode partials of all gathered heads are projected by W_UV to fp16
+    # [T, H, v_head_dim] before the DCP all-to-all + LSE combine, which then
+    # exchanges v_head_dim instead of kv_lora_rank values per head and writes
+    # the combined rows straight into attn_out. Layers with RoPE or non-causal
+    # multi-token decode (the DSpark draft model) keep the stock decode tail.
+    def _check_wuv_before_dcp_combine(self, vllm_config: VllmConfig) -> bool:
+        if self.rotary_emb is not None or self.non_causal_multi_token_decode:
+            return False
+        option = "VLLM_KIMI_K3_MLA_WUV_BEFORE_DCP_COMBINE"
+        if self.dcp_manager is None:
+            raise ValueError(
+                f"{option} requires decode context parallelism "
+                "(decode_context_parallel_size > 1)."
+            )
+        if not self.dcp_manager.use_a2a:
+            raise ValueError(f"{option} requires dcp_comm_backend='a2a'.")
+        if self.attn_backend.get_name() != "TOKENSPEED_MLA":
+            raise NotImplementedError(
+                f"{option} is supported with the TOKENSPEED_MLA decode backend "
+                f"only, got {self.attn_backend.get_name()}."
+            )
+        extra = vllm_config.additional_config
+        decode_backend = (
+            extra.get("decode_backend", "auto") if isinstance(extra, dict) else "auto"
+        )
+        if decode_backend != "auto":
+            raise ValueError(
+                f"{option} changes the stock MLA decode path and cannot be "
+                f"combined with decode_backend={decode_backend!r}."
+            )
+        return True
+
+    def _init_wuv_before_dcp_combine(self, act_dtype: torch.dtype) -> None:
+        """Gather ``W_UV`` of every DCP rank's heads and set up the exchange."""
+        option = "VLLM_KIMI_K3_MLA_WUV_BEFORE_DCP_COMBINE"
+        manager = self.dcp_manager
+        assert manager is not None
+        num_heads, latent_dim, v_dim = (
+            self.num_local_heads,
+            self.kv_lora_rank,
+            self.v_head_dim,
+        )
+        local = self.W_UV.detach().contiguous()
+        if (
+            tuple(local.shape) != (num_heads, latent_dim, v_dim)
+            or local.dtype != torch.bfloat16
+            or act_dtype != torch.bfloat16
+        ):
+            raise NotImplementedError(
+                f"{option} requires bf16 W_UV {(num_heads, latent_dim, v_dim)} and "
+                f"bf16 activations, got {local.dtype} {tuple(local.shape)} and "
+                f"{act_dtype} ({self.layer_name})."
+            )
+        group = manager.group
+        # Heads in DCP rank order, as the query gather lays them out.
+        gathered = local.new_empty((group.world_size * num_heads, latent_dim, v_dim))
+        torch.distributed.all_gather_into_tensor(
+            gathered, local, group=group.device_group
+        )
+        own_heads = slice(
+            group.rank_in_group * num_heads, (group.rank_in_group + 1) * num_heads
+        )
+        if not torch.equal(gathered[own_heads], local):
+            raise RuntimeError(
+                f"{option}: gathered W_UV does not match the local heads "
+                f"({self.layer_name})."
+            )
+        bound = wuv_projection_bound(gathered, self.kv_a_layernorm.weight)
+        if not fits_fp16_exchange(bound):
+            raise ValueError(
+                f"{option}: the fp16 exchange of {self.layer_name} is not provably "
+                f"free of overflow (projection bound {bound:.0f})."
+            )
+        if self._dcp_wuv is not None and self._dcp_wuv.shape == gathered.shape:
+            # Weight reload: keep the address captured by CUDA graphs.
+            self._dcp_wuv.copy_(gathered)
+        else:
+            self._dcp_wuv = gathered
+        self._dcp_wuv_workspace = get_direct_dcp_a2a_workspace(
+            group,
+            manager.device,
+            manager.max_num_tokens,
+            num_heads,
+            v_dim,
+            torch.float16,
+            manager.num_ubatches,
+        )
+        # Compile the projection now rather than inside a CUDA graph capture.
+        mla_wuv_projection(
+            gathered.new_zeros((1, gathered.shape[0], latent_dim)),
+            gathered,
+            gathered.new_empty((1, gathered.shape[0], v_dim), dtype=torch.float16),
+        )
+        logger.info_once(
+            "Kimi-K3 MLA decode applies W_UV before the DCP combine (fp16 exchange)."
+        )
+
+    def _dcp_combine_projected(
+        self,
+        latent: torch.Tensor,
+        lse: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """``out`` = DCP LSE combine of ``latent @ W_UV`` over all heads."""
+        assert self._dcp_wuv is not None and self.dcp_manager is not None
+        num_tokens = latent.shape[0]
+        projected = latent.new_empty(
+            (num_tokens, self._dcp_wuv.shape[0], self.v_head_dim), dtype=torch.float16
+        )
+        mla_wuv_projection(latent, self._dcp_wuv, projected)
+        out = out.view(num_tokens, self.num_local_heads, self.v_head_dim)
+        is_lse_base_on_e = self.impl.lse_base_on_e
+        workspace = self._dcp_wuv_workspace
+        if workspace is not None and num_tokens <= workspace.max_num_tokens:
+            workspace.lse_reduce_into(
+                projected, lse, is_lse_base_on_e, seq_lens, query_start_loc, out
+            )
+            return
+        # Same NCCL fallback as MLADCPManager for batches above the workspace.
+        combined = dcp_a2a_lse_reduce(
+            projected,
+            lse,
+            cp_group=self.dcp_manager.group,
+            is_lse_base_on_e=is_lse_base_on_e,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+        )
+        out.copy_(combined)
 
     def _attn_read_kv_cache(self) -> torch.Tensor:
         """Latent cache as seen by the attention read kernels (decode / context).
@@ -715,6 +870,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             latent_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
                 mqa_q, self._attn_read_kv_cache(), attn_metadata, self
             )
+            if self._dcp_wuv is not None and not self.is_draft_layer:
+                assert lse is not None
+                assert attn_metadata.decode is not None
+                self._dcp_combine_projected(
+                    latent_out,
+                    lse,
+                    attn_metadata.decode.seq_lens,
+                    attn_metadata.query_start_loc[: attn_metadata.num_decodes + 1],
+                    attn_out[:num_mqa_tokens],
+                )
+                return
             if self.dcp_world_size > 1:
                 assert lse is not None
                 assert self.dcp_manager is not None

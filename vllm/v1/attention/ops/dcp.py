@@ -1140,6 +1140,49 @@ class DirectDCPA2AWorkspace(DirectCPWorkspace):
         )
         return output
 
+    def lse_reduce_into(
+        self,
+        partial_output: torch.Tensor,
+        partial_lse: torch.Tensor,
+        is_lse_base_on_e: bool,
+        seq_lens: torch.Tensor | None,
+        query_start_loc: torch.Tensor | None,
+        out: torch.Tensor,
+    ) -> None:
+        """``out.copy_(self.lse_reduce(...))`` for a [T, heads_per_rank,
+        head_dim] FP16/BF16 ``out``. The Triton implementation writes ``out``
+        directly, rounding to the payload dtype first, with the same result."""
+        if self._triton_lse_reduce is None or not out.is_contiguous():
+            out.copy_(
+                self.lse_reduce(
+                    partial_output,
+                    partial_lse,
+                    is_lse_base_on_e,
+                    seq_lens,
+                    query_start_loc,
+                )
+            )
+            return
+        ubatch = dbo_current_ubatch_id()
+        self._triton_lse_reduce(
+            partial_output,
+            partial_lse,
+            seq_lens,
+            query_start_loc,
+            self.peer_output_ptrs[ubatch],
+            self.peer_lse_ptrs[ubatch],
+            self.peer_signal_ptrs[ubatch],
+            self.received_output[ubatch],
+            self.received_lse[ubatch],
+            self.received_signal[ubatch],
+            self.epoch[ubatch : ubatch + 1],
+            out,
+            self.world_size,
+            self.rank,
+            self.max_num_tokens,
+            is_lse_base_on_e,
+        )
+
 
 @functools.cache
 def get_direct_dcp_a2a_workspace(

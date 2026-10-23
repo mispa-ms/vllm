@@ -206,6 +206,7 @@ if TYPE_CHECKING:
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
     VLLM_USE_TRITON_DIRECT_DCP_A2A: bool = False
     VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS: bool = False
+    VLLM_KIMI_K3_MLA_WUV_BEFORE_DCP_COMBINE: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -2256,6 +2257,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # precision; opt-in.
     "VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS": lambda: bool(
         int(os.getenv("VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS", "0"))
+    ),
+    # Kimi-K3 MLA decode with DCP: apply W_UV to the partials of all gathered
+    # heads before the DCP combine and exchange them in fp16 (target-model
+    # layers only). Lowers precision; opt-in.
+    "VLLM_KIMI_K3_MLA_WUV_BEFORE_DCP_COMBINE": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_MLA_WUV_BEFORE_DCP_COMBINE", "0"))
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
