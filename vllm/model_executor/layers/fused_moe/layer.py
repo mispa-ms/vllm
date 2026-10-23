@@ -50,6 +50,7 @@ def make_parallel_config(
     pcp_size: int | None,
     is_sequence_parallel: bool,
     parallel_config: ParallelConfig,
+    ep_size_in_tp: int = 1,
 ) -> FusedMoEParallelConfig:
     tp_size_ = (
         tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
@@ -68,9 +69,68 @@ def make_parallel_config(
 
     assert moe_parallel_config.is_sequence_parallel == is_sequence_parallel
 
+    if ep_size_in_tp > 1:
+        moe_parallel_config = split_experts_within_tp(
+            moe_parallel_config, ep_size_in_tp
+        )
+
     logger.debug("FusedMoEParallelConfig = %s", str(moe_parallel_config))
 
     return moe_parallel_config
+
+
+def split_experts_within_tp(
+    tp_config: FusedMoEParallelConfig, ep_size: int
+) -> FusedMoEParallelConfig:
+    """Split a TP-only MoE layout into ``ep_size`` expert-parallel groups.
+
+    The TP group of size ``T`` becomes ``ep_size`` groups of ``T // ep_size``
+    ranks: TP rank ``r`` is EP rank ``r // (T // ep_size)`` and MoE TP rank
+    ``r % (T // ep_size)``. Each EP group holds a contiguous slice of the
+    experts, TP-sharded over its ranks. Tokens stay replicated on every rank
+    as with plain TP, so no dispatch or combine is needed: every rank returns
+    a partial output and the usual TP all-reduce sums them. Per-rank weight
+    memory is the same as with plain TP; the summation grouping differs, so
+    results are not bitwise equal to the TP-only layout.
+    """
+    unsupported = []
+    if tp_config.use_ep:
+        unsupported.append("expert parallel (--enable-expert-parallel)")
+    if tp_config.dp_size > 1:
+        unsupported.append("data parallel")
+    if tp_config.pcp_size > 1:
+        unsupported.append("prefill context parallel")
+    if tp_config.is_sequence_parallel:
+        unsupported.append("sequence parallel")
+    if tp_config.enable_eplb:
+        unsupported.append("EPLB")
+    if tp_config.use_passthrough_all2all:
+        unsupported.append("the passthrough all2all backend")
+    if unsupported:
+        raise ValueError(
+            "Expert parallelism within the TP group requires a TP-only MoE "
+            f"layout; got {', '.join(unsupported)}."
+        )
+    if ep_size < 1 or tp_config.tp_size % ep_size != 0:
+        raise ValueError(
+            f"Expert parallel size within TP ({ep_size}) must divide the TP "
+            f"size ({tp_config.tp_size})."
+        )
+    tp_size = tp_config.tp_size // ep_size
+    return FusedMoEParallelConfig(
+        tp_size=tp_size,
+        tp_rank=tp_config.tp_rank % tp_size,
+        pcp_size=1,
+        pcp_rank=0,
+        dp_size=1,
+        dp_rank=0,
+        ep_size=ep_size,
+        ep_rank=tp_config.tp_rank // tp_size,
+        sp_size=1,
+        use_ep=True,
+        all2all_backend=tp_config.all2all_backend,
+        enable_eplb=False,
+    )
 
 
 def determine_expert_counts(
@@ -143,6 +203,7 @@ def FusedMoEFactory(
     routed_experts_cls: type[RoutedExperts] | None = None,
     routed_experts_args: dict[str, Any] | None = None,
     skip_padding: bool = False,
+    ep_size_in_tp: int = 1,
 ) -> MoERunner:
     """Factory function for creating MoE execution pipeline.
 
@@ -221,6 +282,8 @@ def FusedMoEFactory(
         routed_experts_cls: Custom RoutedExperts class (None = use default)
         routed_experts_args: Additional arguments for routed_experts constructor
         skip_padding: Whether grouped routing should invalidate padding rows.
+        ep_size_in_tp: Number of expert-parallel groups to split a TP-only
+            layout into (1 = plain TP). See ``split_experts_within_tp``.
 
     Returns:
         MoERunner: Configured MoE execution pipeline ready for forward passes
@@ -239,7 +302,13 @@ def FusedMoEFactory(
         pcp_size=pcp_size,
         is_sequence_parallel=is_sequence_parallel,
         parallel_config=vllm_config.parallel_config,
+        ep_size_in_tp=ep_size_in_tp,
     )
+    if ep_size_in_tp > 1 and (enable_eplb or num_redundant_experts):
+        raise ValueError(
+            "Expert parallelism within the TP group does not support EPLB or "
+            "redundant experts."
+        )
 
     # Resolve the deferred all-reduce request against the parallel config.
     skip_final_all_reduce = (
@@ -298,6 +367,17 @@ def FusedMoEFactory(
         num_fused_shared_experts=num_fused_shared_experts,
         rocm_aiter_enabled=rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul,
     )
+    if ep_size_in_tp > 1 and (
+        expert_map_manager.placement_strategy != "linear"
+        or global_num_experts % ep_size_in_tp != 0
+    ):
+        # Monolithic kernels address the local experts by a contiguous offset.
+        raise ValueError(
+            "Expert parallelism within the TP group requires linear expert "
+            f"placement and a number of experts divisible by {ep_size_in_tp}; "
+            f"got {expert_map_manager.placement_strategy!r} placement and "
+            f"{global_num_experts} experts."
+        )
 
     # TODO(bnell): we should not have to create a router if the kernel is
     # monolithic.

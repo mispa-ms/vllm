@@ -535,6 +535,33 @@ class KimiMoE(nn.Module):
                 prefix=f"{prefix}.experts",
             )
         else:
+            # Optionally split the routed experts into expert-parallel groups
+            # inside the TP group. MTP draft layers (layer_idx after the target
+            # layers) keep the TP-only layout.
+            ep_size_in_tp = envs.VLLM_KIMI_K3_MOE_EP_SIZE_IN_TP
+            if ep_size_in_tp < 1:
+                raise ValueError(
+                    "VLLM_KIMI_K3_MOE_EP_SIZE_IN_TP must be >= 1, got "
+                    f"{ep_size_in_tp}."
+                )
+            if layer_idx >= config.num_hidden_layers:
+                ep_size_in_tp = 1
+            if ep_size_in_tp > 1:
+                if (
+                    not self.use_latent_moe
+                    or self.padded_moe_intermediate_size != moe_intermediate_size
+                    or specialized_decode_config(vllm_config) is not None
+                ):
+                    raise NotImplementedError(
+                        "VLLM_KIMI_K3_MOE_EP_SIZE_IN_TP > 1 requires latent MoE, "
+                        "an unpadded expert intermediate size and the default "
+                        "decode backend."
+                    )
+                logger.info_once(
+                    "Kimi-K3 routed experts use %d expert-parallel groups "
+                    "inside the TP group.",
+                    ep_size_in_tp,
+                )
             self.experts = FusedMoEFactory(
                 shared_experts=self.shared_experts,
                 num_experts=num_experts,
@@ -562,6 +589,7 @@ class KimiMoE(nn.Module):
                 is_sequence_parallel=use_sequence_parallel,
                 skip_padding=True,
                 runner_cls=LatentMoERunner if self.use_latent_moe else None,
+                ep_size_in_tp=ep_size_in_tp,
             )
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)

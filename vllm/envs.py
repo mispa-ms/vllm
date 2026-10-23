@@ -218,6 +218,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16: bool = False
+    VLLM_KIMI_K3_MOE_EP_SIZE_IN_TP: int = 1
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1669,6 +1670,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # changes, so outputs and recurrent states are bitwise identical.
     "VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16", "0"))
+    ),
+    # Kimi-K3 routed experts of the target model: split them into this many
+    # expert-parallel groups inside the TP group (1 = plain TP). Each group
+    # holds a contiguous slice of the experts, TP-sharded over its ranks;
+    # tokens stay replicated and the existing TP all-reduce sums the partial
+    # outputs, so no collective is added. Requires a TP-only MoE layout (no
+    # --enable-expert-parallel, DP, PCP, sequence parallel or EPLB). The
+    # summation grouping changes, so results are not bitwise equal to plain TP.
+    "VLLM_KIMI_K3_MOE_EP_SIZE_IN_TP": lambda: int(
+        os.getenv("VLLM_KIMI_K3_MOE_EP_SIZE_IN_TP", "1")
     ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3

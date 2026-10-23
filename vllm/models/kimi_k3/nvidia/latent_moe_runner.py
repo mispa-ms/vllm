@@ -82,12 +82,12 @@ class LatentMoERunner(MoERunner):
         if (
             self.enable_k3_latent_moe_tail_fusion
             and use_fused_path
-            and self.moe_config.tp_size not in (8, 16)
+            and self._latent_reduce_size not in (8, 16)
         ):
             logger.warning_once(
                 "K3 latent-MoE tail fusion currently supports TP=8 and TP=16, "
                 "but TP=%d is configured. Falling back to the default path.",
-                self.moe_config.tp_size,
+                self._latent_reduce_size,
             )
             self.enable_k3_latent_moe_tail_fusion = False
 
@@ -169,6 +169,20 @@ class LatentMoERunner(MoERunner):
         assert hidden_states.numel() <= buf.numel()
 
         return buf[: hidden_states.numel()].view_as(hidden_states)
+
+    @property
+    def _latent_reduce_size(self) -> int:
+        """Number of ranks whose routed partial outputs the tail all-reduces.
+
+        This is the MoE TP size, except when the experts are also split into
+        expert-parallel groups inside the TP group (``ep_size_in_tp`` of
+        ``make_parallel_config``, the only layout with both EP and TP > 1):
+        every rank of the TP group then holds a partial output.
+        """
+        parallel_config = self.moe_config.moe_parallel_config
+        if parallel_config.use_ep and parallel_config.tp_size > 1:
+            return parallel_config.tp_size * parallel_config.ep_size
+        return parallel_config.tp_size
 
     def _use_fused_path(self) -> bool:
         # The fused path merges the latent and shared reductions into one
@@ -279,7 +293,7 @@ class LatentMoERunner(MoERunner):
             latent = tensor_model_parallel_all_reduce(fused_output)
 
         weight = transform.up_proj.weight
-        shard_size = weight.shape[0] // self.moe_config.tp_size
+        shard_size = weight.shape[0] // self._latent_reduce_size
         shard_start = get_tensor_model_parallel_rank() * shard_size
 
         # column-parallel
@@ -387,13 +401,12 @@ class LatentMoERunner(MoERunner):
             flashinfer_trtllm_fused_allreduce_norm,
         )
 
-        if self.moe_config.tp_size == 1:
+        world_size = self._latent_reduce_size
+        if world_size == 1:
             return norm(hidden_states)
 
         if flashinfer_trtllm_fused_allreduce_norm is not None:
-            ok, max_token_num = _can_use_flashinfer(
-                hidden_states, self.moe_config.tp_size
-            )
+            ok, max_token_num = _can_use_flashinfer(hidden_states, world_size)
             if ok:
                 norm_out = torch.empty_like(hidden_states)
                 # With norm_out provided, the kernel writes the new residual
@@ -404,7 +417,7 @@ class LatentMoERunner(MoERunner):
                     residual=self._get_zero_residual(hidden_states, max_token_num),
                     rms_gamma=norm.weight,
                     rms_eps=norm.variance_epsilon,
-                    world_size=self.moe_config.tp_size,
+                    world_size=world_size,
                     weight_bias=0.0,
                     launch_with_pdl=True,
                     fp32_acc=True,
