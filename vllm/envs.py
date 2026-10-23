@@ -169,6 +169,7 @@ if TYPE_CHECKING:
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
+    VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT: bool = False
     VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = True
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -1474,6 +1475,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+    # If set, Kimi-K3 target MLA layers running decode context parallelism
+    # with a plain fp8 KV cache and an fp8 prefill query keep the chunked-context
+    # workspace in fp8: the cache rows are gathered and all-gathered as stored
+    # and reorganized by one Triton kernel. A KV-cache group only uses it when
+    # every layer's k_scale is 1.0, which makes the K/V passed to the prefill
+    # attention bitwise identical to the default path.
+    "VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT", "0"))
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,

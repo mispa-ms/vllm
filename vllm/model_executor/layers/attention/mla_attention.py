@@ -1643,6 +1643,9 @@ class MLACommonPrefillMetadata:
         padded_local_token_to_seq: torch.Tensor | None = None
         num_local_context_tokens: int = 0
         local_starts: list[int] | None = None
+        # Source row of every reorganized context row in the all-gathered
+        # buffer; only set for an fp8 DCP workspace (see mla_context_fp8.py).
+        context_row_map: torch.Tensor | None = None
 
         @property
         def num_requests(self) -> int:
@@ -2247,6 +2250,18 @@ def build_mla_chunked_context_metadata(
             chunk.local_starts = local_starts_per_chunk[index]
         chunks.append(chunk)
 
+    if use_dcp and chunked_prefill_workspace.dtype == torch.float8_e4m3fn:
+        # Only VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT allocates an fp8 workspace
+        # under DCP; its context loop reorganizes rows through these maps.
+        from vllm.model_executor.layers.attention.mla_context_fp8 import (
+            build_context_row_maps,
+        )
+
+        for chunk, row_map in zip(
+            chunks, build_context_row_maps(chunks, dcp_world_size, device)
+        ):
+            chunk.context_row_map = row_map
+
     return MLACommonPrefillMetadata.ChunkedContextMetadata(
         context_lens=context_lens_gpu,
         workspace=chunked_prefill_workspace,
@@ -2445,6 +2460,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         )
 
         use_packed_fp8_cache = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        use_fp8_dcp_context = False
+        if envs.VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT:
+            from vllm.model_executor.layers.attention import mla_context_fp8
+
+            use_fp8_dcp_context = mla_context_fp8.use_fp8_dcp_context(
+                self, layer_names, vllm_config
+            )
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             # Note(hc): The local kvcache is incomplete when DCP is triggered,
@@ -2452,15 +2474,20 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             # required, so the workspace has to be enlarged by 1/DCP relative
             # to the original TP allocation.
             assert self.chunked_prefill_workspace_size % self.dcp_world_size == 0
+            if use_fp8_dcp_context:
+                # Context rows stay fp8 from the cache through the all-gather.
+                workspace_dtype = mla_context_fp8.FP8_DTYPE
+            elif use_packed_fp8_cache:
+                workspace_dtype = torch.bfloat16
+            else:
+                workspace_dtype = self.model_config.dtype
             self.chunked_prefill_workspace = torch.empty(
                 (
                     self.chunked_prefill_workspace_size
                     + self.chunked_prefill_workspace_size // self.dcp_world_size,
                     self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim,
                 ),
-                dtype=torch.bfloat16
-                if use_packed_fp8_cache
-                else self.model_config.dtype,
+                dtype=workspace_dtype,
                 device=device,
             )
             self.dcp_manager = getattr(attention_layer, "dcp_manager", None)
@@ -2469,6 +2496,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 self.chunked_prefill_workspace,
                 self.chunked_prefill_workspace_size,
             )
+            if use_fp8_dcp_context:
+                mla_context_fp8.prepare_fp8_dcp_context(self, layer_names)
         else:
             self.chunked_prefill_workspace = torch.empty(
                 (
@@ -3091,6 +3120,14 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         output = None
         output_lse = None
         workspace = chunked_context.workspace
+        # Under DCP only VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT allocates an fp8
+        # workspace: context rows are then gathered and all-gathered as stored
+        # and reorganized through each chunk's row map (k_scale is 1.0).
+        fp8_context = workspace.dtype == torch.float8_e4m3fn
+        if fp8_context:
+            from vllm.model_executor.layers.attention import mla_context_fp8
+
+            mla_context_fp8.get_fp8_dcp_context_state(self, k_scale)
 
         for chunk in chunked_context.chunks:
             assert chunk.padded_local_seq_lens is not None
@@ -3108,6 +3145,16 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     dst=workspace[:toks],
                     block_table=block_table,
                     workspace_starts=padded_local_cu_seq_lens,
+                    batch_size=chunk.num_requests,
+                    seq_starts=chunk.starts,
+                )
+            elif fp8_context:
+                # Copy the fp8 rows as stored, without dequantizing.
+                ops.cp_gather_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace[:toks],
+                    block_table=block_table,
+                    cu_seq_lens=padded_local_cu_seq_lens,
                     batch_size=chunk.num_requests,
                     seq_starts=chunk.starts,
                 )
@@ -3151,20 +3198,29 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 cur_allgather_kvcache.shape[-1]
                 == self.kv_lora_rank + self.qk_rope_head_dim
             )
-            allgatered_kv_c_normed, allgatered_k_pe = cur_allgather_kvcache.unsqueeze(
-                1
-            ).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            if fp8_context:
+                assert chunk.context_row_map is not None
+                # bf16 latent and the gathered fp8 k_pe bytes, in reorg order.
+                kv_c_normed, k_pe = mla_context_fp8.gather_fp8_context_rows(
+                    cur_allgather_kvcache, chunk.context_row_map, self.kv_lora_rank
+                )
+            else:
+                allgatered_kv_c_normed, allgatered_k_pe = (
+                    cur_allgather_kvcache.unsqueeze(1).split(
+                        [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+                    )
+                )
 
-            kv_c_normed, k_pe = reorg_kvcache(
-                allgatered_kv_c_normed,
-                allgatered_k_pe,
-                padded_local_chunk_seq_lens_lst=chunk.padded_local_seq_lens,
-                local_context_lens_allranks=chunk.local_context_lens_allranks,
-                local_starts=chunk.local_starts,
-                sum_seq_len=chunk.num_context_tokens,
-                max_seq_len=chunk.max_seq_len,
-                toks=toks,
-            )
+                kv_c_normed, k_pe = reorg_kvcache(
+                    allgatered_kv_c_normed,
+                    allgatered_k_pe,
+                    padded_local_chunk_seq_lens_lst=chunk.padded_local_seq_lens,
+                    local_context_lens_allranks=chunk.local_context_lens_allranks,
+                    local_starts=chunk.local_starts,
+                    sum_seq_len=chunk.num_context_tokens,
+                    max_seq_len=chunk.max_seq_len,
+                    toks=toks,
+                )
             if kv_b_proj_input_dtype is not None:
                 kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
 
