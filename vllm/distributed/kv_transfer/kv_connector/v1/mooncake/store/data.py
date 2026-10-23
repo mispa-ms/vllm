@@ -7,7 +7,7 @@
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -23,6 +23,11 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashListWithBlockSize,
 )
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.key_trim import (  # noqa: E501
+        KeyTrimPlan,
+    )
 
 logger = init_logger(__name__)
 
@@ -575,6 +580,9 @@ class ChunkedTokenDatabase:
         self.store_layout = store_layout or RankLocalStoreLayout(
             metadata, block_size, self.hash_block_size
         )
+        # Set by MooncakeStoreWorker.register_kv_caches when
+        # VLLM_MOONCAKE_STORE_KEY_TRIM is on; None stores full pages.
+        self.key_trim_plan: KeyTrimPlan | None = None
 
     @property
     def kv_caches_base_addr(self) -> list[int]:

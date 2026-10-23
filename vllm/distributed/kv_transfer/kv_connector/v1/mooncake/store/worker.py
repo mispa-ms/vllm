@@ -57,6 +57,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     TailKeyBoundary,
     TPShardedStoreLayout,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.key_trim import (  # noqa: E501
+    build_key_trim_plans,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
     RESET_MSG,
@@ -607,6 +610,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if (cdiv(num_tokens, db.block_size) - 1) % put_step != put_step_rank:
                 continue
             addr, size = db.prepare_value_for_block(block_id)
+            if db.key_trim_plan is not None:
+                addr, size = db.key_trim_plan.trim(addr, size, num_tokens)
             puts.append(
                 (db.key_for(req_meta.block_hashes[hash_idx]), addr, size, db.metadata)
             )
@@ -909,6 +914,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     block_ids_per_group[g_idx],
                     shards_per_group[g_idx],
                 )
+                if db.key_trim_plan is not None:
+                    # Each chunk is keyed by the hash of the prefix ending at
+                    # its end.
+                    db.key_trim_plan.trim_values(
+                        group_addrs, group_sizes, [end for _, end in chunks]
+                    )
                 addrs.extend(group_addrs)
                 sizes.extend(group_sizes)
 
@@ -1171,6 +1182,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 req_meta.block_ids[g_idx],
                 store_shard_ids,
             )
+            if db.key_trim_plan is not None:
+                # Same key boundaries as above: the tail chunk may be keyed
+                # by its tail boundary, every other chunk by its end.
+                key_tokens = [
+                    tail_key_boundaries.get(g_idx, end) if end == token_len else end
+                    for _, end in chunks
+                ]
+                db.key_trim_plan.trim_values(g_addrs, g_sizes, key_tokens)
             addr_list.extend(g_addrs)
             size_list.extend(g_sizes)
             block_id_list.extend(g_block_ids)
@@ -1385,6 +1404,13 @@ class MooncakeStoreWorker:
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         self.dcp_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        # Placement of DCP-sharded KV rows, only needed to trim Store values
+        # (VLLM_MOONCAKE_STORE_KEY_TRIM, see register_kv_caches).
+        self._key_trim_interleave_size: int | None = (
+            parallel_config.cp_kv_cache_interleave_size
+            if envs.VLLM_MOONCAKE_STORE_KEY_TRIM
+            else None
+        )
 
         assert vllm_config.kv_transfer_config is not None
         kv_role = vllm_config.kv_transfer_config.kv_role
@@ -1880,6 +1906,9 @@ class MooncakeStoreWorker:
             num_device_segments,
         )
 
+        if envs.VLLM_MOONCAKE_STORE_KEY_TRIM:
+            self._enable_key_trim(kv_caches, use_group_regions)
+
         # Start transfer threads
         if self.can_put:
             ready_event_sending = threading.Event()
@@ -1932,6 +1961,37 @@ class MooncakeStoreWorker:
             ready_event_recving.wait()
         logger.info(
             "Started %d Mooncake KV-load receive thread(s)", self.num_recv_threads
+        )
+
+    def _enable_key_trim(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        use_group_regions: bool,
+    ) -> None:
+        """Attach a Store value trim plan (see key_trim.py) to every token
+        database, built from the registered KV cache views."""
+        if use_group_regions:
+            raise NotImplementedError(
+                "VLLM_MOONCAKE_STORE_KEY_TRIM does not support HiSparse KV "
+                "cache regions."
+            )
+        assert self._key_trim_interleave_size is not None
+        plans = build_key_trim_plans(
+            kv_caches,
+            self._kv_cache_groups,
+            self.token_dbs,
+            self.num_blocks,
+            pcp_size=self.pcp_size,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=self._key_trim_interleave_size,
+        )
+        for db, plan in zip(self.token_dbs, plans, strict=True):
+            db.key_trim_plan = plan
+        logger.info_once(
+            "MooncakeStore value trimming is on for %d of %d KV cache groups.",
+            sum(plan is not None for plan in plans),
+            len(plans),
         )
 
     def start_load_kv(self, metadata: MooncakeStoreConnectorMetadata):
