@@ -2461,7 +2461,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         use_packed_fp8_cache = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
         use_fp8_dcp_context = False
-        if envs.VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT:
+        if (
+            envs.VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT
+            or envs.VLLM_KIMI_K3_MLA_FUSED_KV_B_PACK
+        ):
             from vllm.model_executor.layers.attention import mla_context_fp8
 
             use_fp8_dcp_context = mla_context_fp8.use_fp8_dcp_context(
@@ -3124,10 +3127,18 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         # workspace: context rows are then gathered and all-gathered as stored
         # and reorganized through each chunk's row map (k_scale is 1.0).
         fp8_context = workspace.dtype == torch.float8_e4m3fn
+        fused_kv_b_pack = False
         if fp8_context:
             from vllm.model_executor.layers.attention import mla_context_fp8
 
-            mla_context_fp8.get_fp8_dcp_context_state(self, k_scale)
+            fp8_context_state = mla_context_fp8.get_fp8_dcp_context_state(self, k_scale)
+            # VLLM_KIMI_K3_MLA_FUSED_KV_B_PACK: one GEMM replaces kv_b_proj and
+            # the fused K/V pack below; compared with them at startup on random
+            # inputs at sampled row counts (check_fused_kv_b_pack).
+            fused_kv_b_pack = (
+                fp8_context_state.fused_kv_b_pack
+                and fused_mla_kv_concat_fn is not None
+            )
 
         for chunk in chunked_context.chunks:
             assert chunk.padded_local_seq_lens is not None
@@ -3224,19 +3235,24 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             if kv_b_proj_input_dtype is not None:
                 kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
 
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            if fused_mla_kv_concat_fn is not None:
-                k, v = fused_mla_kv_concat_fn(kv_nope, k_pe, use_fp8_prefill)
-            else:
-                if use_fp8_prefill:
-                    kv_nope = kv_nope.to(prefill_metadata.q_data_type)
-                    k_pe = k_pe.to(prefill_metadata.q_data_type)
-                k_nope, v = kv_nope.split(
-                    [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+            if fused_kv_b_pack:
+                k, v = mla_context_fp8.fused_kv_b_proj_fp8_pack(
+                    kv_c_normed, self.kv_b_proj.weight, k_pe, self.num_heads
                 )
-                k = self._concat_k_nope_k_pe(k_nope, k_pe)
+            else:
+                kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+                )
+                if fused_mla_kv_concat_fn is not None:
+                    k, v = fused_mla_kv_concat_fn(kv_nope, k_pe, use_fp8_prefill)
+                else:
+                    if use_fp8_prefill:
+                        kv_nope = kv_nope.to(prefill_metadata.q_data_type)
+                        k_pe = k_pe.to(prefill_metadata.q_data_type)
+                    k_nope, v = kv_nope.split(
+                        [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+                    )
+                    k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
             attn_output, attn_softmax_lse = (
                 prefill_metadata.prefill_backend.run_prefill_context_chunk(

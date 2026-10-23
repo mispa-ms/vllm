@@ -170,6 +170,7 @@ if TYPE_CHECKING:
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT: bool = False
+    VLLM_KIMI_K3_MLA_FUSED_KV_B_PACK: bool = False
     VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = True
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -1483,6 +1484,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # attention bitwise identical to the default path.
     "VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT", "0"))
+    ),
+    # If set together with VLLM_KIMI_K3_MLA_FP8_DCP_CONTEXT, the fp8 DCP
+    # chunked-context path runs kv_b_proj and the fp8 K/V pack as one Triton
+    # GEMM whose epilogue writes the packed K and V. Used per layer for a plain
+    # bf16 kv_b_proj. A startup check compares it with kv_b_proj followed by
+    # the pack on random inputs at sampled row counts and raises if any differ.
+    "VLLM_KIMI_K3_MLA_FUSED_KV_B_PACK": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_MLA_FUSED_KV_B_PACK", "0"))
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,

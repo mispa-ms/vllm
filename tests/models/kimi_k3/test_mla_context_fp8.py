@@ -377,7 +377,9 @@ class _EmulatedKVGather:
             gathered[rank * toks : (rank + 1) * toks].copy_(self.scratch[:toks])
 
 
-def _run_context_loop(workspace_dtype, fused_pack, k_scale, device):
+def _run_context_loop(
+    workspace_dtype, fused_pack, k_scale, device, fused_kv_b_pack=False
+):
     workspace_size = _aligned_workspace_size(256, _BLOCK_SIZE, _DCP, _INTERLEAVE)
     metadata = _build_metadata(
         _CONTEXT_LENS,
@@ -426,7 +428,9 @@ def _run_context_loop(workspace_dtype, fused_pack, k_scale, device):
     )
     impl._concat_k_nope_k_pe = MLACommonImpl._concat_k_nope_k_pe.__get__(impl)
     if workspace_dtype == FP8:
-        mla_context_fp8.set_fp8_dcp_context_state(impl, k_scale)
+        mla_context_fp8.set_fp8_dcp_context_state(
+            impl, k_scale, fused_kv_b_pack=fused_kv_b_pack
+        )
 
     fused_fn = None
     if fused_pack:
@@ -466,15 +470,23 @@ def _run_context_loop(workspace_dtype, fused_pack, k_scale, device):
 
 
 @requires_cuda
-@pytest.mark.parametrize("fused_pack", [False, True], ids=["generic", "k3_pack"])
+@pytest.mark.parametrize(
+    "fused_pack,fused_kv_b_pack",
+    [(False, False), (True, False), (True, True)],
+    ids=["generic", "k3_pack", "fused_kv_b_pack"],
+)
 @torch.inference_mode()
-def test_fp8_context_matches_default_path(fused_pack):
+def test_fp8_context_matches_default_path(fused_pack, fused_kv_b_pack):
+    if fused_kv_b_pack and not current_platform.is_device_capability_family(100):
+        pytest.skip("the fused kv_b_proj GEMM targets SM100-family GPUs")
     device = torch.device("cuda")
     k_scale = torch.ones(1, dtype=torch.float32, device=device)
     ref_kv, ref_out, ref_lse = _run_context_loop(
         torch.bfloat16, fused_pack, k_scale, device
     )
-    kv, out, lse = _run_context_loop(FP8, fused_pack, k_scale, device)
+    kv, out, lse = _run_context_loop(
+        FP8, fused_pack, k_scale, device, fused_kv_b_pack=fused_kv_b_pack
+    )
     assert len(kv) == len(ref_kv)
     for index, ((k, v), (ref_k, ref_v)) in enumerate(zip(kv, ref_kv)):
         assert torch.equal(k, ref_k), f"chunk {index}: K bytes differ"
