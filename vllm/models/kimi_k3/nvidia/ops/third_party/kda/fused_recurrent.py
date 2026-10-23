@@ -5,10 +5,15 @@
 # This file contains code adapted from the flash-linear-attention project.
 # The original source was licensed under the MIT license.
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+# Modified by NVIDIA: opt-in 16-wide value block for large speculative-verify
+# launches of fused_recurrent_kda_fwd (VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16).
 # ruff: noqa: E501
+
+import functools
 
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.op import exp, log
 from vllm.triton_utils import tl, triton
@@ -307,12 +312,22 @@ def get_fused_recurrent_kda_fwd_warmup_profiles(
     num_heads: int,
 ) -> tuple[int, ...]:
     """Return representative sequence counts for gated launch variants."""
-    # The region above 192 head-sequences reuses the second launch variant.
+    # The region above 192 head-sequences reuses the second launch variant, or
+    # the third one for speculative verify with VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16.
     return (
         1,
         48 // num_heads + 1,
         96 // num_heads + 1,
     )
+
+
+@functools.cache
+def _use_spec_verify_bv16() -> bool:
+    """Whether speculative-verify launches above 192 head-sequences use BV=16.
+
+    Read once per process; call ``cache_clear()`` after changing the variable.
+    """
+    return envs.VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16
 
 
 def fused_recurrent_kda_fwd(
@@ -380,6 +395,11 @@ def fused_recurrent_kda_fwd(
         elif head_sequences <= 96:
             BV, num_stages = 8, 3
         elif head_sequences <= 192:
+            BV, num_stages = 16, 3
+        elif num_accepted_tokens is not None and _use_spec_verify_bv16():
+            # Opt-in: speculative verify keeps the 16-wide variant above 192
+            # head-sequences. BV only changes how the value columns are split
+            # across programs, so outputs and states are bitwise identical.
             BV, num_stages = 16, 3
         else:
             BV, num_stages = 8, 3

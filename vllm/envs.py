@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
+    VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16: bool = False
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1659,6 +1660,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use the SM100 BF16 GEMM-AR kernel for eligible Kimi-K3 row-parallel
     # attention projections. All TP ranks must belong to one NVLink domain.
     "VLLM_KIMI_K3_GEMM_AR": lambda: bool(int(os.getenv("VLLM_KIMI_K3_GEMM_AR", "1"))),
+    # Kimi-K3 KDA: when a speculative-verify call of the recurrent kernel has
+    # more than 192 (heads x sequences), launch it with a 16-wide value block
+    # (BV=16) instead of BV=8. Only the split of value columns across programs
+    # changes, so outputs and recurrent states are bitwise identical.
+    "VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16", "0"))
+    ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3
     # attention/shared-expert projections, DeepSeek-V4.1 ``wo_b``). All TP
