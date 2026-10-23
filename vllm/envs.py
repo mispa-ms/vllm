@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
+    VLLM_USE_TRITON_DIRECT_DCP_A2A: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -2243,6 +2244,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_USE_DIRECT_DCP_KV_GATHER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_DIRECT_DCP_KV_GATHER")
+    ),
+    # Run the direct symmetric-memory DCP A2A LSE reduce with Triton kernels
+    # instead of the CUDA op. Same protocol and bit-identical output.
+    "VLLM_USE_TRITON_DIRECT_DCP_A2A": lambda: bool(
+        int(os.getenv("VLLM_USE_TRITON_DIRECT_DCP_A2A", "0"))
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to

@@ -1090,6 +1090,17 @@ class DirectDCPA2AWorkspace(DirectCPWorkspace):
         self.received_signal, self.peer_signal_ptrs = self._allocate(
             signal_shape, torch.int32
         )
+        self._triton_lse_reduce: Callable[..., None] | None = None
+        if envs.VLLM_USE_TRITON_DIRECT_DCP_A2A:
+            from vllm.v1.attention.ops.dcp_a2a_combine_triton import (
+                direct_dcp_a2a_lse_reduce_triton,
+            )
+
+            logger.info_once(
+                "Using Triton kernels for the direct symmetric-memory DCP A2A "
+                "LSE reduce."
+            )
+            self._triton_lse_reduce = direct_dcp_a2a_lse_reduce_triton
 
     def lse_reduce(
         self,
@@ -1104,7 +1115,12 @@ class DirectDCPA2AWorkspace(DirectCPWorkspace):
         output = partial_output.new_empty(
             (num_tokens, self.heads_per_rank, self.head_dim)
         )
-        torch.ops._C.direct_dcp_a2a_lse_reduce(
+        lse_reduce_op = (
+            torch.ops._C.direct_dcp_a2a_lse_reduce
+            if self._triton_lse_reduce is None
+            else self._triton_lse_reduce
+        )
+        lse_reduce_op(
             partial_output,
             partial_lse,
             seq_lens,
