@@ -251,6 +251,7 @@ if TYPE_CHECKING:
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
     MOONCAKE_REQUESTER_LOCAL_HOSTNAME: str | None = None
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
+    VLLM_MEGA_MOE_SP_SHARD_BUFFER: bool = False
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = True
     VLLM_BEAM_ALWAYS_CONSTRAIN_OUTPUT: bool = True
@@ -1871,6 +1872,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This is used to prevent the kernel from running out of memory.
     "VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE": lambda: int(
         os.getenv("VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE", "163840")
+    ),
+    # DeepGEMM MegaMoE: size the symmetric buffer of a sequence-parallel MoE
+    # layer (e.g. Kimi K3 with expert parallelism and TP > 1) for one shard,
+    # cdiv(max_num_batched_tokens, tensor_parallel_size) tokens per rank,
+    # instead of max_num_batched_tokens tokens per rank.
+    "VLLM_MEGA_MOE_SP_SHARD_BUFFER": lambda: bool(
+        int(os.getenv("VLLM_MEGA_MOE_SP_SHARD_BUFFER", "0"))
     ),
     # MoE routing strategy selector.
     # See `RoutingSimulator.get_available_strategies()` # for available

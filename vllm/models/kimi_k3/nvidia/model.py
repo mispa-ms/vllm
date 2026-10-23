@@ -520,6 +520,7 @@ class KimiMoE(nn.Module):
             num_local_experts = num_experts // ep_size
             self.experts = DeepGemmMegaMoEExperts(
                 vllm_config,
+                is_sequence_parallel=use_sequence_parallel,
                 num_experts=num_experts,
                 num_local_experts=num_local_experts,
                 experts_start_idx=ep_rank * num_local_experts,

@@ -19,7 +19,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_ep_group
+from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -38,6 +38,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 logger = init_logger(__name__)
@@ -253,6 +254,10 @@ class DeepGemmMegaMoEExperts(nn.Module):
         weight_format: Routed-expert precision, a row of the feature matrix.
         shared_experts: Shared MLP to fuse if it is unsharded and in one of
             the ``weight_format.shared`` precisions; ``None`` never fuses.
+        is_sequence_parallel: The caller hands this layer one sequence-parallel
+            shard of the batch (tokens split over the TP group). With
+            ``VLLM_MEGA_MOE_SP_SHARD_BUFFER`` the symmetric buffer is then
+            sized for one shard instead of the whole batch.
 
     """
 
@@ -274,6 +279,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
         shared_experts: nn.Module | None = None,
         num_logical_experts: int | None = None,
         fast_math: bool = True,
+        is_sequence_parallel: bool = False,
         prefix: str = "",
     ):
         super().__init__()
@@ -301,7 +307,16 @@ class DeepGemmMegaMoEExperts(nn.Module):
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        # Per-rank token bound: forward() rejects larger inputs and the
+        # symmetric buffer is sized for it.
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        if is_sequence_parallel and envs.VLLM_MEGA_MOE_SP_SHARD_BUFFER:
+            # A sequence-parallel shard of at most max_num_batched_tokens
+            # tokens has at most cdiv(max_num_batched_tokens, tp_size) rows,
+            # the same bound the DeepGEMM warmup uses for these layers.
+            self.max_num_tokens = cdiv(
+                self.max_num_tokens, get_tensor_model_parallel_world_size()
+            )
         self.weight_format = weight_format
         self.activation = activation
         self.fast_math = fast_math
