@@ -8,12 +8,16 @@ from typing import ClassVar
 import torch
 import torch.distributed as dist
 
+import vllm.envs as envs
 from vllm.distributed import get_tp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.warmup.cutedsl_warmup import (
     CuTeDSLCompileUnit,
     register_cutedsl_warmup_provider,
 )
+
+logger = init_logger(__name__)
 
 _MAX_NUM_TOKENS = 128
 _SKINNY_MAX_NUM_TOKENS = 5
@@ -23,6 +27,13 @@ _B_PRIME_STAGES = 2
 _COLLECTIVE_TOKEN_CTAS = 32
 _LAMPORT_COPY_CTAS = 32
 _LAMPORT_COPY_THREADS = 128
+# CTA counts accepted by VLLM_KIMI_K3_LAMPORT_COPY_CTAS. The copy is a
+# grid-stride loop over M * hidden_size / 8 16-byte fragments, so any count
+# copies every fragment exactly once. The launch is clamped to one fragment
+# per thread, 896 CTAs at 128 tokens, so larger counts change nothing. The
+# copy CTAs spin on the mailbox while the producers may still run, so only
+# counts whose forward progress was checked are accepted.
+_LAMPORT_COPY_CTAS_CHOICES = (128, 256, 896)
 _SUPPORTED_TP_SIZES = (8, 16)
 
 
@@ -37,6 +48,69 @@ class KimiK3LatentMoETailContract:
     max_num_tokens: int
     rms_eps: float
     experts_per_token: int
+
+
+def _lamport_copy_ctas_unsupported(
+    contract: KimiK3LatentMoETailContract,
+) -> str | None:
+    """Why VLLM_KIMI_K3_LAMPORT_COPY_CTAS does not apply to ``contract``."""
+    if contract.tp_size != 8:
+        return f"tp_size={contract.tp_size} (requires 8)"
+    if (contract.hidden_size, contract.latent_size) != (7168, 3584):
+        return (
+            f"hidden_size={contract.hidden_size}, "
+            f"latent_size={contract.latent_size} (requires 7168, 3584)"
+        )
+    if contract.max_num_tokens != _MAX_NUM_TOKENS:
+        return (
+            f"max_num_tokens={contract.max_num_tokens} "
+            f"(requires {_MAX_NUM_TOKENS})"
+        )
+    if contract.experts_per_token not in (0, 16):
+        return (
+            f"experts_per_token={contract.experts_per_token} (requires 0 or 16)"
+        )
+    if contract.dtype != torch.bfloat16:
+        return f"dtype={contract.dtype} (requires torch.bfloat16)"
+    if contract.device.type != "cuda":
+        return f"device={contract.device} (requires a CUDA device)"
+    capability = tuple(torch.cuda.get_device_capability(contract.device))
+    if capability != (10, 3):
+        return f"compute capability {capability} (requires (10, 3))"
+    return None
+
+
+def _lamport_copy_ctas(contract: KimiK3LatentMoETailContract) -> int:
+    """CTA count of the Lamport copy of the tail op for ``contract``.
+
+    The stock count unless VLLM_KIMI_K3_LAMPORT_COPY_CTAS is set and the op
+    is in the scope the option supports; only the launch width changes.
+    """
+    ctas = envs.VLLM_KIMI_K3_LAMPORT_COPY_CTAS
+    if ctas == 0:
+        return _LAMPORT_COPY_CTAS
+    if ctas not in _LAMPORT_COPY_CTAS_CHOICES:
+        raise ValueError(
+            "VLLM_KIMI_K3_LAMPORT_COPY_CTAS must be 0 (stock) or one of "
+            f"{_LAMPORT_COPY_CTAS_CHOICES}, got {ctas}."
+        )
+    reason = _lamport_copy_ctas_unsupported(contract)
+    if reason is not None:
+        logger.info_once(
+            "VLLM_KIMI_K3_LAMPORT_COPY_CTAS=%d does not apply to a K3 "
+            "latent-MoE tail op with %s; it keeps the stock %d-CTA "
+            "Lamport copy.",
+            ctas,
+            reason,
+            _LAMPORT_COPY_CTAS,
+        )
+        return _LAMPORT_COPY_CTAS
+    logger.info_once(
+        "K3 latent-MoE tail: Lamport copy with %d CTAs "
+        "(VLLM_KIMI_K3_LAMPORT_COPY_CTAS).",
+        ctas,
+    )
+    return ctas
 
 
 class KimiK3LatentMoETailOp:
@@ -126,6 +200,7 @@ class KimiK3LatentMoETailOp:
                 "K3 latent-MoE tail fusion requires hidden_size=7168 and "
                 "latent_size=3584."
             )
+        lamport_copy_ctas = _lamport_copy_ctas(contract)
 
         self.contract = contract
         self.rank = dist.get_rank(group)
@@ -163,7 +238,7 @@ class KimiK3LatentMoETailOp:
             self._lamport_copy = LamportCopyKernel(
                 hidden_dim=contract.hidden_size,
                 max_m=contract.max_num_tokens,
-                ctas=_LAMPORT_COPY_CTAS,
+                ctas=lamport_copy_ctas,
                 threads=_LAMPORT_COPY_THREADS,
             )
         register_cutedsl_warmup_provider(self)

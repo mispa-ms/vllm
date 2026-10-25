@@ -224,6 +224,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_KDA_FUSED_SPEC_VERIFY: bool = False
     VLLM_KIMI_K3_MOE_EP_SIZE_IN_TP: int = 1
     VLLM_KIMI_K3_MOE_STREAM_OVERLAP_MAX_TOKENS: int = 0
+    VLLM_KIMI_K3_LAMPORT_COPY_CTAS: int = 0
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1721,6 +1722,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD.
     "VLLM_KIMI_K3_MOE_STREAM_OVERLAP_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_KIMI_K3_MOE_STREAM_OVERLAP_MAX_TOKENS", "0")
+    ),
+    # Kimi-K3 latent-MoE tail (decode, up to 128 tokens): launch the final
+    # Lamport mailbox copy with this many CTAs instead of the stock 32. One of
+    # 128, 256 or 896 (0 = stock). Applies to TP8 bf16 tail ops with top-k 0
+    # or 16 on compute capability 10.3 devices; other tail ops keep the stock
+    # launch. The kernel only moves bytes, so outputs are bitwise identical.
+    "VLLM_KIMI_K3_LAMPORT_COPY_CTAS": lambda: int(
+        os.getenv("VLLM_KIMI_K3_LAMPORT_COPY_CTAS", "0")
     ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3
