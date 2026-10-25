@@ -9,6 +9,7 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
@@ -822,6 +823,15 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 self.gemm_rs_ar = gemm_rs_ar
             else:
                 gemm_rs_ar.warn_incompatible_projection()
+        # VLLM_KIMI_K3_KDA_FUSED_SPEC_VERIFY: run pure speculative-verify
+        # batches with one fused kernel (bitwise identical to the native chain).
+        self._fused_spec_verify_fn: Callable[..., bool] | None = None
+        if envs.VLLM_KIMI_K3_KDA_FUSED_SPEC_VERIFY:
+            from vllm.models.kimi_k3.nvidia.ops.kda_fused_spec_verify import (
+                maybe_fused_spec_verify,
+            )
+
+            self._fused_spec_verify_fn = maybe_fused_spec_verify
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -927,6 +937,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             return
         assert isinstance(attn_metadata_narrowed, KimiK3KDAMetadata)
         m = attn_metadata_narrowed
+        fused_spec_verify = getattr(self, "_fused_spec_verify_fn", None)
+        if fused_spec_verify is not None and fused_spec_verify(
+            self, m, mixed_qkv, g1, g2, beta, core_attn_out
+        ):
+            return
         has_initial_state = m.has_initial_state
         non_spec_query_start_loc = m.non_spec_query_start_loc
         non_spec_state_indices_tensor = m.non_spec_state_indices_tensor

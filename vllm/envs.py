@@ -220,6 +220,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16: bool = False
+    VLLM_KIMI_K3_KDA_FUSED_SPEC_VERIFY: bool = False
     VLLM_KIMI_K3_MOE_EP_SIZE_IN_TP: int = 1
     VLLM_KIMI_K3_MOE_STREAM_OVERLAP_MAX_TOKENS: int = 0
     VLLM_ENABLE_GEMM_RS: bool = False
@@ -1692,6 +1693,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # changes, so outputs and recurrent states are bitwise identical.
     "VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16", "0"))
+    ),
+    # Kimi-K3 KDA: run pure speculative-verify batches (T=4, 12 local heads of
+    # 128, native spec-decode backend, dim-first conv state) with one fused
+    # kernel instead of conv1d update -> recurrent kernel -> gated RMSNorm.
+    # Bitwise identical to the three kernels; needs Blackwell (SM100+).
+    "VLLM_KIMI_K3_KDA_FUSED_SPEC_VERIFY": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_KDA_FUSED_SPEC_VERIFY", "0"))
     ),
     # Kimi-K3 routed experts of the target model: split them into this many
     # expert-parallel groups inside the TP group (1 = plain TP). Each group

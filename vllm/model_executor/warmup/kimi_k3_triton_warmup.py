@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
+from collections import Counter
 from typing import TYPE_CHECKING
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -236,3 +239,122 @@ def kimi_k3_triton_warmup(worker: Worker) -> None:
 
     _warm_attn_res(worker)
     _warm_recurrent_kda(layer, worker.model_config.dtype)
+
+
+def _kv_layout_supported(layer: KimiK3DeltaAttention) -> bool:
+    from vllm.models.kimi_k3.nvidia.ops.kda_fused_spec_verify import (
+        CONV_STATE_LEN,
+    )
+
+    kv_cache = layer.kv_cache
+    if not isinstance(kv_cache, (list, tuple)) or len(kv_cache) < 2:
+        return False
+    conv_state, state = kv_cache[0], kv_cache[1]
+    if not isinstance(conv_state, torch.Tensor) or not isinstance(state, torch.Tensor):
+        return False
+    H, D = layer.local_num_heads, layer.head_dim
+    return (
+        conv_state.dtype == torch.bfloat16
+        and tuple(conv_state.shape[1:]) == (3 * H * D, CONV_STATE_LEN)
+        and conv_state.stride()[1:] == (CONV_STATE_LEN, 1)
+        and state.dtype == torch.bfloat16
+        and tuple(state.shape[1:]) == (H, D, D)
+        and state.stride()[1:] == (D * D, D, 1)
+    )
+
+
+@torch.inference_mode()
+def kimi_k3_kda_fused_spec_verify_warmup(worker: Worker) -> None:
+    """Compile the fused KDA speculative verify before CUDA-graph capture.
+
+    With VLLM_KIMI_K3_KDA_FUSED_SPEC_VERIFY set, checks that at least one KDA
+    layer supports it and compiles the kernel for the two input layouts the
+    captured decode graphs use (the in_proj_qkvgfab output and the
+    low-latency projection-overlap output), once per KV-cache layout. A call
+    during capture with a layout that was not compiled here runs the stock
+    kernels.
+    """
+    if not envs.VLLM_KIMI_K3_KDA_FUSED_SPEC_VERIFY:
+        return
+    kda = sys.modules.get("vllm.models.kimi_k3.nvidia.kda")
+    static_context = getattr(
+        getattr(worker.model_runner, "compilation_config", None),
+        "static_forward_context",
+        None,
+    )
+    if kda is None or not isinstance(static_context, dict):
+        return
+    layers = [
+        layer
+        for layer in static_context.values()
+        if isinstance(layer, kda.KimiK3DeltaAttention)
+    ]
+    if not layers:
+        return
+    if not (current_platform.is_cuda() and current_platform.has_device_capability(100)):
+        raise NotImplementedError(
+            "VLLM_KIMI_K3_KDA_FUSED_SPEC_VERIFY requires an NVIDIA Blackwell "
+            "(SM100 or newer) GPU."
+        )
+    from vllm.models.kimi_k3.nvidia.ops import kda_fused_spec_verify as fused
+
+    unsupported: Counter[str] = Counter()
+    supported = []
+    for layer in layers:
+        reason = fused.layer_unsupported_reason(layer)
+        if reason is None and not _kv_layout_supported(layer):
+            reason = "KV cache is not a bf16 dim-first conv state + bf16 state"
+        if reason is None:
+            supported.append(layer)
+        else:
+            unsupported[reason] += 1
+    if not supported:
+        raise ValueError(
+            "VLLM_KIMI_K3_KDA_FUSED_SPEC_VERIFY is set, but no KDA layer supports "
+            f"it: {dict(unsupported)}."
+        )
+    if unsupported:
+        logger.warning(
+            "Fused KDA speculative verify is off for %d of %d KDA layers: %s",
+            sum(unsupported.values()),
+            len(layers),
+            dict(unsupported),
+        )
+    # KimiK3DeltaAttention.forward splits the in_proj_qkvgfab output as
+    # [3*H*D, H*D, D, H, padding]; the projection-overlap path produces the
+    # first 4*H*D columns and [D, H] separately.
+    first = supported[0]
+    proj_rows = (
+        4 * first.local_projection_size
+        + first.head_dim
+        + first.local_num_heads
+        + int(first.in_proj_padding)
+    )
+    overlap = None
+    low_latency_gemm = importlib.import_module(
+        "vllm.models.kimi_k3.nvidia.low_latency_gemm"
+    )
+    qkvg_rows = getattr(low_latency_gemm, "_KDA_QKVG_SIZE", None)
+    if isinstance(qkvg_rows, int) and 0 < qkvg_rows < proj_rows:
+        overlap = (qkvg_rows, proj_rows - qkvg_rows)
+    by_kv_layout = {}
+    for layer in supported:
+        conv_state, state = layer.kv_cache[0], layer.kv_cache[1]
+        key = (
+            conv_state.stride(0),
+            state.stride(0),
+            conv_state.data_ptr() % 16 == 0,
+            state.data_ptr() % 16 == 0,
+        )
+        by_kv_layout.setdefault(key, layer)
+    variants = []
+    for layer in by_kv_layout.values():
+        variants += fused.precompile_capture_variants(layer, proj_rows, overlap)
+    logger.info(
+        "Fused KDA speculative verify on %d of %d KDA layers; compiled %d launch "
+        "variants (int args %s).",
+        len(supported),
+        len(layers),
+        len(variants),
+        ", ".join(str(v[2]) for v in variants),
+    )
