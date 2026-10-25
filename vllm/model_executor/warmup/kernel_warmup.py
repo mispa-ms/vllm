@@ -5,6 +5,7 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+import contextlib
 import json
 import sys
 import time
@@ -265,6 +266,16 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
     )
+    if envs.VLLM_FLASHINFER_MOE_TACTIC_PIN and not (
+        enable_flashinfer_autotune is not False
+        and has_flashinfer()
+        and current_platform.has_device_capability(90)
+    ):
+        raise ValueError(
+            "VLLM_FLASHINFER_MOE_TACTIC_PIN pins FlashInfer autotune results, but "
+            "FlashInfer autotune does not run here (disabled, FlashInfer missing "
+            "or a GPU older than SM90)."
+        )
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if enable_flashinfer_autotune is False:
         logger.info_once("Skipping FlashInfer autotune because it is disabled.")
@@ -489,10 +500,34 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
                 tuner.clear_cache()
         autotune_context = fi_utils.autotune(tune_mode=True, **autotune_kwargs)
 
+    # VLLM_FLASHINFER_MOE_TACTIC_PIN: profile only the pinned MoE tactic at the
+    # pinned token buckets, and verify the result below.
+    tactic_pins = None
+    tactic_pin_context: contextlib.AbstractContextManager = contextlib.nullcontext({})
+    if envs.VLLM_FLASHINFER_MOE_TACTIC_PIN:
+        from vllm.model_executor.warmup import flashinfer_moe_tactic_pin
+
+        tactic_pins = flashinfer_moe_tactic_pin.parse_tactic_pins(
+            envs.VLLM_FLASHINFER_MOE_TACTIC_PIN
+        )
+        flashinfer_moe_tactic_pin.check_buckets(
+            tactic_pins,
+            tuple(
+                fi_utils.flashinfer_get_hybrid_num_tokens_buckets(
+                    flashinfer_moe_tactic_pin.BUCKET_REFERENCE_MAX_TOKENS
+                )
+            ),
+        )
+        tactic_pin_context = flashinfer_moe_tactic_pin.pin_moe_tactics(tactic_pins)
+
     group = tune_group.cpu_group if tune_group.world_size > 1 else None
     set_autotune_process_group(group)
     try:
-        with torch.inference_mode(), autotune_context:
+        with (
+            torch.inference_mode(),
+            autotune_context,
+            tactic_pin_context as restricted_tactics,
+        ):
             hisparse_enabled = (
                 runner.vllm_config.attention_config.hisparse_config is not None
             )
@@ -516,3 +551,8 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
             world.barrier()
     elif tuner._dirty:
         tuner.save_configs(str(cache_path))
+
+    if tactic_pins is not None:
+        flashinfer_moe_tactic_pin.verify_moe_tactic_pins(
+            tactic_pins, restricted_tactics
+        )

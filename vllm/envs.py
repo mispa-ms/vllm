@@ -228,6 +228,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
+    VLLM_FLASHINFER_MOE_TACTIC_PIN: str = ""
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
@@ -1867,6 +1868,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             for v in os.environ["VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS"].split(",")
             if v.strip()
         ]
+    ),
+    # FlashInfer TRT-LLM FP4 MoE: autotune only this tactic at these token
+    # buckets, "<bucket>=<tile_n>:<config>,..." (e.g. "256=16:391,512=32:455").
+    # Tactic ids are specific to the FlashInfer build and GPU. Empty: off.
+    "VLLM_FLASHINFER_MOE_TACTIC_PIN": lambda: os.getenv(
+        "VLLM_FLASHINFER_MOE_TACTIC_PIN", ""
     ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
