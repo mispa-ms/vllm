@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TokenSpeed CuTe DSL MLA decode backend (Blackwell, FP8 KV cache only)."""
 
+import functools
+import types
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -91,21 +93,113 @@ def _check_fp16_partials_supported() -> None:
         )
 
 
-def _tokenspeed_mla_decode_fp16_partials(**kwargs):
+def _check_lse_no_zero_fill_supported() -> None:
+    from tokenspeed_mla import mla_decode
+
+    names = ("torch", "_get_split_kv_and_workspace_size", "tokenspeed_mla_decode")
+    if any(name not in vars(mla_decode) for name in names) or (
+        mla_decode.tokenspeed_mla_decode.__globals__ is not vars(mla_decode)
+    ):
+        raise NotImplementedError(
+            "VLLM_TOKENSPEED_MLA_TARGET_LSE_NO_ZERO_FILL needs a tokenspeed_mla "
+            "whose mla_decode allocates the LSE with its module-level torch and "
+            "sizes the split-KV workspace with _get_split_kv_and_workspace_size."
+        )
+
+
+def _use_lse_no_zero_fill(fp16_partials_for_target: bool) -> bool:
+    """Whether VLLM_TOKENSPEED_MLA_TARGET_LSE_NO_ZERO_FILL applies."""
+    if not envs.VLLM_TOKENSPEED_MLA_TARGET_LSE_NO_ZERO_FILL:
+        return False
+    if not fp16_partials_for_target:
+        raise ValueError(
+            "VLLM_TOKENSPEED_MLA_TARGET_LSE_NO_ZERO_FILL applies to the "
+            "fp16-partials target-layer path; it requires "
+            "VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS=1."
+        )
+    _check_lse_no_zero_fill_supported()
+    return True
+
+
+class _LseNoZeroFillTorch(types.ModuleType):
+    """``torch`` as seen by tokenspeed_mla.mla_decode during one decode call.
+
+    Everything is the real torch module except ``zeros``: the call's float32
+    [B, q_len, H] LSE buffer is allocated with ``torch.empty`` when the
+    split-KV reduction kernel runs (non-zero workspace), because that kernel
+    writes every LSE element. Without the reduction the single kernel may skip
+    empty rows, so the buffer stays zero-filled.
+    """
+
+    def __init__(self, real_torch: types.ModuleType):
+        super().__init__("torch")
+        self.__dict__["_real_torch"] = real_torch
+        self.__dict__["_reduction"] = None
+        self.__dict__["_lse_allocated"] = False
+
+    def __getattr__(self, name: str):
+        return getattr(self.__dict__["_real_torch"], name)
+
+    def record_workspace_size(self, workspace_size: int) -> None:
+        self.__dict__["_reduction"] = workspace_size != 0
+
+    def zeros(self, *args, **kwargs):
+        real_torch = self.__dict__["_real_torch"]
+        reduction = self.__dict__["_reduction"]
+        if (
+            reduction is not None
+            and not self.__dict__["_lse_allocated"]
+            and len(args) == 1
+            and isinstance(args[0], tuple)
+            and len(args[0]) == 3
+            and set(kwargs) == {"dtype", "device"}
+            and kwargs["dtype"] is real_torch.float32
+        ):
+            self.__dict__["_lse_allocated"] = True
+            if reduction:
+                return real_torch.empty(*args, **kwargs)
+        return real_torch.zeros(*args, **kwargs)
+
+
+def _tokenspeed_mla_decode_fp16_partials(lse_no_zero_fill: bool = False, **kwargs):
     """``tokenspeed_mla_decode`` with fp16 split-KV partial outputs.
 
     tokenspeed_mla selects the partial dtype with a module-level switch that
     ``tokenspeed_mla_decode`` reads at call time (part of its kernel cache
     key), so the switch is set for the duration of this call only.
+
+    With ``lse_no_zero_fill`` the LSE buffer of a call that runs the split-KV
+    reduction is not zero-filled (see _LseNoZeroFillTorch): mla_decode's
+    ``torch`` global and its workspace sizing are swapped for this call only.
     """
     from tokenspeed_mla import mla_decode
 
     previous = mla_decode._FP16_PARTIALS
     mla_decode._FP16_PARTIALS = True
+    if not lse_no_zero_fill:
+        try:
+            return mla_decode.tokenspeed_mla_decode(**kwargs)
+        finally:
+            mla_decode._FP16_PARTIALS = previous
+
+    real_torch = mla_decode.torch
+    real_split = mla_decode._get_split_kv_and_workspace_size
+    proxy = _LseNoZeroFillTorch(real_torch)
+
+    @functools.wraps(real_split)
+    def split(*args, **split_kwargs):
+        split_kv, workspace_size = real_split(*args, **split_kwargs)
+        proxy.record_workspace_size(workspace_size)
+        return split_kv, workspace_size
+
+    mla_decode.torch = proxy
+    mla_decode._get_split_kv_and_workspace_size = split
     try:
         return mla_decode.tokenspeed_mla_decode(**kwargs)
     finally:
         mla_decode._FP16_PARTIALS = previous
+        mla_decode.torch = real_torch
+        mla_decode._get_split_kv_and_workspace_size = real_split
 
 
 class TokenspeedMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
@@ -216,6 +310,9 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
     # VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS: fp16 split-KV partials on
     # target-model layers (draft-model layers keep fp32).
     fp16_partials_for_target: bool = False
+    # VLLM_TOKENSPEED_MLA_TARGET_LSE_NO_ZERO_FILL: skip zero-filling the LSE
+    # buffer of target-layer calls that run the split-KV reduction.
+    lse_no_zero_fill_for_target: bool = False
 
     def __init__(
         self,
@@ -289,6 +386,8 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 "layers (VLLM_TOKENSPEED_MLA_TARGET_FP16_PARTIALS)."
             )
             self.fp16_partials_for_target = True
+        if _use_lse_no_zero_fill(self.fp16_partials_for_target):
+            self.lse_no_zero_fill_for_target = True
 
         self.softmax_scale: float | None = None
         self.output_scale: float | None = None
@@ -380,7 +479,10 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         if self.fp16_partials_for_target and not getattr(
             layer, "is_draft_layer", False
         ):
-            decode = _tokenspeed_mla_decode_fp16_partials
+            decode = functools.partial(
+                _tokenspeed_mla_decode_fp16_partials,
+                lse_no_zero_fill=self.lse_no_zero_fill_for_target,
+            )
         kernel_out = decode(
             query=q,
             kv_cache=kv_c_and_k_pe_cache,
