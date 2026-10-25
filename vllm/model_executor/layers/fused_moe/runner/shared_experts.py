@@ -57,6 +57,11 @@ class SharedExperts(torch.nn.Module):
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
 
+        # Largest token count that runs the shared experts on the aux stream.
+        # None uses VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD; a model may
+        # set it per layer (Kimi-K3: VLLM_KIMI_K3_MOE_STREAM_OVERLAP_MAX_TOKENS).
+        self.aux_stream_max_tokens: int | None = None
+
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
         # TODO: Remove this after more extensive testings with TP/DP
@@ -108,11 +113,13 @@ class SharedExperts(torch.nn.Module):
         if self._mk_can_overlap_shared_experts():
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
+        max_tokens = self.aux_stream_max_tokens
+        if max_tokens is None:
+            max_tokens = envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda_alike()
             and self._stream is not None
-            and hidden_states.shape[0]
-            <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+            and hidden_states.shape[0] <= max_tokens
         )
 
         if should_run_shared_in_aux_stream:

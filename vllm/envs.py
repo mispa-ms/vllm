@@ -221,6 +221,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_KIMI_K3_KDA_SPEC_VERIFY_BV16: bool = False
     VLLM_KIMI_K3_MOE_EP_SIZE_IN_TP: int = 1
+    VLLM_KIMI_K3_MOE_STREAM_OVERLAP_MAX_TOKENS: int = 0
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1701,6 +1702,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # summation grouping changes, so results are not bitwise equal to plain TP.
     "VLLM_KIMI_K3_MOE_EP_SIZE_IN_TP": lambda: int(
         os.getenv("VLLM_KIMI_K3_MOE_EP_SIZE_IN_TP", "1")
+    ),
+    # Kimi-K3 latent MoE: run the router gate || routed down projection and the
+    # shared experts on the aux stream up to this many tokens (0 = the stock
+    # bounds, 256 tokens and VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD). Only
+    # the stream placement changes, so outputs are bitwise identical. The
+    # latent tail keeps selecting its tier with
+    # VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD.
+    "VLLM_KIMI_K3_MOE_STREAM_OVERLAP_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_KIMI_K3_MOE_STREAM_OVERLAP_MAX_TOKENS", "0")
     ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3

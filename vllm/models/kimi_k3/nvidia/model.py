@@ -607,6 +607,62 @@ class KimiMoE(nn.Module):
                 moe_intermediate_size // self.tp_size
             )
 
+        # Largest token count that overlaps the router gate with the routed
+        # down projection on the aux stream.
+        self._down_proj_stream_max_tokens = _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+        stream_overlap_max_tokens = envs.VLLM_KIMI_K3_MOE_STREAM_OVERLAP_MAX_TOKENS
+        if stream_overlap_max_tokens:
+            self._widen_stream_overlap(stream_overlap_max_tokens)
+
+    def _widen_stream_overlap(self, max_tokens: int) -> None:
+        """Run both pre-expert aux-stream overlaps up to ``max_tokens`` tokens.
+
+        Stock overlaps the router gate with the routed down projection up to
+        _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD tokens and runs the shared
+        experts on the aux stream up to VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+        tokens; above that this block runs serially. This raises both bounds
+        for this layer only. The latent tail keeps selecting its tier with
+        VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD, so larger batches still
+        take the column-parallel tail. Only the stream placement of the same
+        kernels changes, so outputs are bitwise identical.
+        """
+        name = "VLLM_KIMI_K3_MOE_STREAM_OVERLAP_MAX_TOKENS"
+        stock_max_tokens = max(
+            _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD,
+            envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
+        )
+        if max_tokens <= stock_max_tokens:
+            raise ValueError(
+                f"{name} must be 0 (off) or larger than the stock aux-stream "
+                f"bound {stock_max_tokens}, got {max_tokens}."
+            )
+        if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
+            raise ValueError(
+                f"{name} widens the shared-experts aux-stream overlap, which "
+                "VLLM_DISABLE_SHARED_EXPERTS_STREAM turns off. Unset one of them."
+            )
+        shared_experts = None
+        if not self.use_mega_moe and isinstance(self.experts, LatentMoERunner):
+            shared_experts = self.experts.shared_experts
+        if (
+            self.use_sequence_parallel
+            or shared_experts is None
+            or shared_experts._stream is None
+            or self._down_proj_stream is None
+        ):
+            raise NotImplementedError(
+                f"{name} requires latent MoE layers with shared experts and a "
+                "CUDA aux stream, without MegaMoE or sequence parallelism (the "
+                "TP decode path)."
+            )
+        self._down_proj_stream_max_tokens = max_tokens
+        shared_experts.aux_stream_max_tokens = max_tokens
+        logger.info_once(
+            "Kimi-K3 MoE runs the router gate || routed down projection and the "
+            "shared experts on the aux stream up to %d tokens.",
+            max_tokens,
+        )
+
     def _maybe_overlap_router_and_down_proj(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -659,7 +715,7 @@ class KimiMoE(nn.Module):
                 self._down_proj_events[0],
                 self._down_proj_events[1],
                 self._down_proj_stream
-                if num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+                if num_tokens <= self._down_proj_stream_max_tokens
                 else None,
             )
         )
