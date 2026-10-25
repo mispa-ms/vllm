@@ -10,6 +10,7 @@ uses it and that the verification passes or catches a conflicting cache
 entry.
 """
 
+import contextlib
 import sys
 import threading
 import types
@@ -229,6 +230,120 @@ def test_verify_raises_and_passes(fake_flashinfer):
     tuner.stats.failed_tactics[MOE_OP + "::MoERunner"] = {(32, 455)}
     with pytest.raises(RuntimeError, match="failed to profile"):
         tactic_pin.verify_moe_tactic_pins(PINS, {256: "", 512: ""})
+
+
+# ------------------------------------------------- vLLM autotune wiring
+
+
+@pytest.fixture
+def fake_autotune_env(request, monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """flashinfer_autotune() on one rank with stand-ins for FlashInfer and the
+    model runner. The dummy runs ask an FP4 runner for its candidates at
+    buckets 256 and 512 and record the first candidate as FlashInfer's
+    winner."""
+    # Import before the FlashInfer stand-ins replace the real package.
+    import vllm.distributed.parallel_state as parallel_state
+    import vllm.utils.flashinfer as fi_utils
+    from vllm.model_executor.warmup import kernel_warmup
+
+    tuner = request.getfixturevalue("fake_flashinfer").tuner
+    tuner._dirty = False
+    tuner.load_configs = lambda path: False
+    tuner.clear_cache = lambda: None
+    monkeypatch.setattr(
+        sys.modules["flashinfer.autotuner"],
+        "set_autotune_process_group",
+        lambda group: None,
+        raising=False,
+    )
+    group = SimpleNamespace(
+        world_size=1, rank_in_group=0, cpu_group=None, barrier=lambda: None
+    )
+    for name in ("get_world_group", "get_tp_group", "get_pp_group"):
+        monkeypatch.setattr(parallel_state, name, lambda: group)
+    monkeypatch.setattr(
+        fi_utils, "autotune", lambda *args, **kwargs: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        fi_utils,
+        "flashinfer_get_hybrid_num_tokens_buckets",
+        lambda max_tokens: (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024),
+    )
+    monkeypatch.setattr(kernel_warmup, "_flashinfer_autotune_skip_ops", lambda r: None)
+    monkeypatch.setattr(kernel_warmup, "use_flashinfer_autotune_v2", lambda r: False)
+    monkeypatch.setattr(
+        kernel_warmup,
+        "resolve_flashinfer_autotune_file",
+        lambda r: tmp_path / "autotune.json",
+    )
+    monkeypatch.setattr(kernel_warmup, "replayssm_autotune_warmup", lambda r: None)
+    monkeypatch.setattr(kernel_warmup, "_autotune_kimi_k3_kda_qkvg", lambda m: None)
+
+    candidates: dict[int, list] = {}
+
+    def dummy_runs(runner, *, skip_attn=False):
+        for bucket in (256, 512):
+            tactics = _FakeRunner().get_valid_tactics(_inputs(bucket), None)
+            candidates[bucket] = tactics
+            tuner.profiling_cache[_key(bucket)] = (tactics[0], None)
+
+    monkeypatch.setattr(
+        kernel_warmup, "_run_flashinfer_autotune_dummy_runs", dummy_runs
+    )
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_rank=0),
+            attention_config=SimpleNamespace(hisparse_config=None),
+        ),
+        get_model=lambda: None,
+    )
+    return SimpleNamespace(
+        run=lambda: kernel_warmup.flashinfer_autotune(runner),
+        candidates=candidates,
+        tuner=tuner,
+    )
+
+
+def test_flashinfer_autotune_applies_and_verifies_pins(
+    fake_autotune_env, monkeypatch: pytest.MonkeyPatch
+):
+    original = _FakeRunner.get_valid_tactics
+    monkeypatch.setenv(tactic_pin.ENV_NAME, "256=16:391,512=32:455")
+    fake_autotune_env.run()
+    assert fake_autotune_env.candidates == {256: [[16, 391]], 512: [[32, 455]]}
+    assert _FakeRunner.get_valid_tactics is original
+
+
+def test_flashinfer_autotune_reports_pins_not_in_effect(
+    fake_autotune_env, monkeypatch: pytest.MonkeyPatch
+):
+    # A pin the tuned winner does not match: the verification after tuning
+    # must raise.
+    file_key = str((MOE_OP, "MoERunner", ((768, 3584), (768,)), ()))
+    fake_autotune_env.tuner._file_configs[file_key] = ("MoERunner", [64, 3])
+    monkeypatch.setenv(tactic_pin.ENV_NAME, "256=16:391,768=64:2")
+    with pytest.raises(RuntimeError, match="MoE tactic pins are not in effect"):
+        fake_autotune_env.run()
+
+
+def test_flashinfer_autotune_rejects_unknown_buckets(
+    fake_autotune_env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv(tactic_pin.ENV_NAME, "500=16:391")
+    with pytest.raises(ValueError, match="not FlashInfer MoE tuning buckets"):
+        fake_autotune_env.run()
+    assert fake_autotune_env.candidates == {}
+
+
+def test_flashinfer_autotune_without_pins(
+    fake_autotune_env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv(tactic_pin.ENV_NAME, raising=False)
+    fake_autotune_env.run()
+    assert fake_autotune_env.candidates == {
+        256: _FakeRunner.VALID,
+        512: _FakeRunner.VALID,
+    }
 
 
 # ---------------------------------------------------------------- GPU
